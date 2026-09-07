@@ -92,7 +92,7 @@ class TestSettings:
         r = admin_session.get(f"{API}/settings")
         assert r.status_code == 200
         s = r.json()
-        for k in ("name", "address", "gstin", "phone", "gst_rate", "cgst_rate", "sgst_rate", "footer_msg"):
+        for k in ("name", "address", "gstin", "fssai", "phone", "gst_rate", "cgst_rate", "sgst_rate", "footer_msg"):
             assert k in s
 
     def test_update_settings_admin(self, admin_session):
@@ -102,6 +102,7 @@ class TestSettings:
             "name": "TEST_Thali House",
             "address": "Test Addr",
             "gstin": "TEST29ABCDE",
+            "fssai": "12345678901234",
             "phone": "+91 99999",
             "cgst_rate": 6.0,
             "sgst_rate": 6.0,
@@ -112,12 +113,13 @@ class TestSettings:
         assert r.status_code == 200
         got = admin_session.get(f"{API}/settings").json()
         assert got["name"] == "TEST_Thali House"
+        assert got["fssai"] == "12345678901234"
         assert got["cgst_rate"] == 6.0
         assert got["sgst_rate"] == 6.0
         assert got["gst_rate"] == 12.0
         # restore
         admin_session.put(f"{API}/settings", json={
-            "name": cur["name"], "address": cur["address"], "gstin": cur["gstin"],
+            "name": cur["name"], "address": cur["address"], "gstin": cur["gstin"], "fssai": cur.get("fssai", ""),
             "phone": cur["phone"], "cgst_rate": cur.get("cgst_rate", 2.5), "sgst_rate": cur.get("sgst_rate", 2.5),
             "gst_rate": cur["gst_rate"], "footer_msg": cur["footer_msg"],
         })
@@ -128,6 +130,29 @@ class TestSettings:
             "cgst_rate": 2.5, "sgst_rate": 2.5, "gst_rate": 5.0, "footer_msg": "x",
         })
         assert r.status_code == 403
+
+    def test_fssai_and_header_alignment(self, admin_session):
+        cur = admin_session.get(f"{API}/settings").json()
+        payload = {
+            **cur,
+            "fssai": "5555555465555",
+            "header_alignment": "right",
+        }
+        r = admin_session.put(f"{API}/settings", json=payload)
+        assert r.status_code == 200
+        got = admin_session.get(f"{API}/settings").json()
+        assert got["fssai"] == "5555555465555"
+        assert got["header_alignment"] == "right"
+
+        # Test empty FSSAI
+        payload["fssai"] = ""
+        r2 = admin_session.put(f"{API}/settings", json=payload)
+        assert r2.status_code == 200
+        got2 = admin_session.get(f"{API}/settings").json()
+        assert got2["fssai"] == ""
+
+        # Restore
+        admin_session.put(f"{API}/settings", json=cur)
 
 
 # ---------- Categories & Menu ----------

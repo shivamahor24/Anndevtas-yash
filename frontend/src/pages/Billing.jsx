@@ -61,6 +61,14 @@ export default function Billing() {
   const [paymentMethod, setPaymentMethod] = useState("cash");
   const [currentToken, setCurrentToken] = useState(getCurrentToken());
 
+  const cgstRate = useMemo(() => {
+    return settings?.cgst_rate ?? (settings?.gst_rate ? settings.gst_rate / 2 : 2.5);
+  }, [settings]);
+
+  const sgstRate = useMemo(() => {
+    return settings?.sgst_rate ?? (settings?.gst_rate ? settings.gst_rate / 2 : 2.5);
+  }, [settings]);
+
   // Compute Dining Menu and Parcel Menu lists from SINGLE SOURCE OF TRUTH
   const { diningItems, parcelItems } = useMemo(() => {
     const apiMenuList = Array.isArray(menu) ? menu : [];
@@ -141,9 +149,15 @@ export default function Billing() {
     }
   }, [cart.length]);
 
-  // 1. Remove default cart items on load
+  // 1. Remove default cart items on load & listen for token reset
   useEffect(() => {
     setCart([]);
+    const handleTokenReset = () => {
+      setCurrentToken(getCurrentToken());
+      tokenAssignedRef.current = false;
+    };
+    window.addEventListener("tokenReset", handleTokenReset);
+    return () => window.removeEventListener("tokenReset", handleTokenReset);
   }, []);
 
   // 5. Storage control
@@ -215,14 +229,23 @@ export default function Billing() {
 
     const itemCategory = isThali ? "THALI" : (item.category_name || item.category || "GENERAL");
 
-    const targetMode = menuMode || (itemType && itemType !== "both" ? itemType : "parcel");
+    const targetMode = menuMode || (itemType && itemType !== "both" ? itemType : "dining");
+
+    // Per-item GST: if item has gst_enabled, use item_gst_rate; otherwise use global GST setting
+    const itemHasGst = item.gst_enabled === true;
+    const itemGstRate = itemHasGst ? (Number(item.item_gst_rate) || 0) : (cgstRate + sgstRate);
+    const itemCgstRate = itemHasGst ? itemGstRate / 2 : cgstRate;
+    const itemSgstRate = itemHasGst ? itemGstRate / 2 : sgstRate;
+
+    // Both dining & parcel use raw parsedPrice (base price), with GST computed separately
+    const finalPrice = parsedPrice;
 
     setCart((prev) => {
       const existing = prev.find(i => i.id === item.id);
       if (existing) {
         return prev.map(i =>
           i.id === item.id
-            ? { ...i, quantity: i.quantity + 1, qty: i.qty + 1, menuType: targetMode, category: itemCategory }
+            ? { ...i, quantity: i.quantity + 1, qty: i.qty + 1, price: finalPrice, basePrice: parsedPrice, menuType: targetMode, category: itemCategory }
             : i
         );
       }
@@ -230,12 +253,17 @@ export default function Billing() {
         id: item.id,
         _key: item.id,
         name: item.name,
-        price: parsedPrice,
+        price: finalPrice,
+        basePrice: parsedPrice,
         category: itemCategory,
         is_thali: isThali,
         menuType: targetMode,
         quantity: 1,
         qty: 1,
+        gst_enabled: itemHasGst,
+        item_gst_rate: itemGstRate,
+        cgst_rate: itemCgstRate,
+        sgst_rate: itemSgstRate,
         rules: item.rules || null,
         thali_groups: item.thali_groups || item.thali_rules || item.rules || null,
         thali_selections: item.thali_selections || item.selections || null,
@@ -253,7 +281,7 @@ export default function Billing() {
       duration: 1500,
       icon: isThali ? "🍽️" : "📦",
     });
-  }, [cart.length, menuMode]);
+  }, [cart.length, menuMode, cgstRate, sgstRate]);
 
   const addLine = useCallback((line) => {
     const itemId = line.menu_item_id || line.id;
@@ -292,6 +320,12 @@ export default function Billing() {
       }
 
       const uniqueKey = `${itemId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      let rawPrice = line.price;
+      if (typeof rawPrice === "string") {
+        rawPrice = parseFloat(rawPrice.replace(/[^\d.]/g, "")) || 0;
+      }
+      const finalPrice = rawPrice;
+
       return [
         ...prev,
         {
@@ -300,7 +334,8 @@ export default function Billing() {
           _matchKey: lineMatchKey,
           menu_item_id: itemId,
           name: line.name,
-          price: line.price,
+          price: finalPrice,
+          basePrice: rawPrice,
           category: "THALI",
           is_thali: true,
           quantity: line.qty,
@@ -341,14 +376,6 @@ export default function Billing() {
     setDiscount(0);
   }, []);
 
-  const cgstRate = useMemo(() => {
-    return settings?.cgst_rate ?? (settings?.gst_rate ? settings.gst_rate / 2 : 2.5);
-  }, [settings]);
-
-  const sgstRate = useMemo(() => {
-    return settings?.sgst_rate ?? (settings?.gst_rate ? settings.gst_rate / 2 : 2.5);
-  }, [settings]);
-
   const subtotal = useMemo(() => {
     return cart.reduce((sum, item) => {
       const lineItemTotal = item.price * item.quantity;
@@ -357,21 +384,63 @@ export default function Billing() {
     }, 0);
   }, [cart]);
 
+  const isParcel = menuMode === "parcel";
+
   const cgst = useMemo(() => {
-    return subtotal * (cgstRate / 100);
-  }, [subtotal, cgstRate]);
+    return cart.reduce((sum, item) => {
+      const lineTotal = item.price * item.quantity;
+      const extraTotal = (item.extra_bread_charge || 0) * item.quantity;
+      const gross = lineTotal + extraTotal;
+      const cRate = item.cgst_rate !== undefined ? item.cgst_rate : cgstRate;
+      const sRate = item.sgst_rate !== undefined ? item.sgst_rate : sgstRate;
+      const totalRate = cRate + sRate;
+
+      if (isParcel) {
+        if (totalRate > 0) {
+          const base = gross / (1 + totalRate / 100);
+          const taxAmt = gross - base;
+          return sum + taxAmt * (cRate / totalRate);
+        }
+        return sum;
+      } else {
+        return sum + gross * (cRate / 100);
+      }
+    }, 0);
+  }, [cart, cgstRate, sgstRate, isParcel]);
 
   const sgst = useMemo(() => {
-    return subtotal * (sgstRate / 100);
-  }, [subtotal, sgstRate]);
+    return cart.reduce((sum, item) => {
+      const lineTotal = item.price * item.quantity;
+      const extraTotal = (item.extra_bread_charge || 0) * item.quantity;
+      const gross = lineTotal + extraTotal;
+      const cRate = item.cgst_rate !== undefined ? item.cgst_rate : cgstRate;
+      const sRate = item.sgst_rate !== undefined ? item.sgst_rate : sgstRate;
+      const totalRate = cRate + sRate;
+
+      if (isParcel) {
+        if (totalRate > 0) {
+          const base = gross / (1 + totalRate / 100);
+          const taxAmt = gross - base;
+          return sum + taxAmt * (sRate / totalRate);
+        }
+        return sum;
+      } else {
+        return sum + gross * (sRate / 100);
+      }
+    }, 0);
+  }, [cart, cgstRate, sgstRate, isParcel]);
 
   const gst = useMemo(() => {
     return cgst + sgst;
   }, [cgst, sgst]);
 
   const total = useMemo(() => {
-    return Math.max(0, subtotal + gst - discount);
-  }, [subtotal, gst, discount]);
+    if (isParcel) {
+      return Math.max(0, subtotal - discount);
+    } else {
+      return Math.max(0, subtotal + gst - discount);
+    }
+  }, [subtotal, gst, discount, isParcel]);
 
   const refresh = useCallback(async () => {
     // Clear temporary local storage items
@@ -384,34 +453,54 @@ export default function Billing() {
     }
 
     try {
+      const offlineSettings = offlineStorage.loadSettings() || {};
       const [c, m, s] = await Promise.all([
         api.get("/categories"),
         api.get("/menu"),
         api.get("/settings"),
       ]);
 
+      const mergedSettings = {
+        ...offlineSettings,
+        ...(s.data || {}),
+        fssai: (s.data && s.data.fssai !== undefined && s.data.fssai !== null)
+          ? s.data.fssai
+          : (offlineSettings.fssai || ""),
+      };
+
       setCategories(c.data);
       setMenu(m.data);
-      setSettings(s.data);
+      setSettings(mergedSettings);
 
       offlineStorage.saveCategories(c.data);
       offlineStorage.saveMenu(m.data);
-      offlineStorage.saveSettings(s.data);
+      offlineStorage.saveSettings(mergedSettings);
 
       if (
-        s.data &&
-        s.data.language &&
+        mergedSettings &&
+        mergedSettings.language &&
         !localStorage.getItem("pos_language")
       ) {
-        changeLanguage(s.data.language);
+        changeLanguage(mergedSettings.language);
       }
     } catch (e) {
-      console.log("Loaded clean default POS data.");
+      console.log("Loaded clean default POS data or offline.");
+      const cached = offlineStorage.loadSettings();
+      if (cached) setSettings(cached);
     }
   }, [changeLanguage]);
 
   useEffect(() => {
     refresh();
+    const handleSettingsUpdate = () => {
+      const cached = offlineStorage.loadSettings();
+      if (cached) setSettings(cached);
+      refresh();
+    };
+    window.addEventListener("settingsUpdated", handleSettingsUpdate);
+    return () => {
+      window.removeEventListener("settingsUpdated", handleSettingsUpdate);
+    };
   }, [refresh]);
 
 
@@ -467,6 +556,7 @@ export default function Billing() {
     }
     const currentToken = getCurrentToken();
     const payload = {
+      order_type: menuMode || "dining",
       items: cart.map((item) => ({
         menu_item_id: item.id || item.menu_item_id,
         name: item.name,
@@ -497,6 +587,7 @@ export default function Billing() {
       const queued = syncQueue.enqueue(payload);
       const offlineOrder = {
         receipt_no: queued.id,
+        order_type: menuMode || "dining",
         items: payload.items,
         subtotal: subtotal,
         cgst: cgst,
@@ -526,7 +617,11 @@ export default function Billing() {
       const { data } = await api.post("/orders", payload);
       toast.success(`${t("checkout_success")} · #${data.receipt_no} · ₹${data.total} (${mode.toUpperCase()})`);
       if (settings?.auto_print !== false) {
-        printReceipt({ order: data, settings, menuMode, });
+        try {
+          await printReceipt({ order: data, settings, menuMode });
+        } catch (printErr) {
+          console.error("Auto-print error after checkout:", printErr);
+        }
       }
       clear();
       setCustomerName("");
@@ -540,7 +635,18 @@ export default function Billing() {
         setCustomerName("");
         setShowCartMobile(false);
       } else {
-        toast.error(e?.response?.data?.detail || t("checkout_failed"));
+        const detail = e?.response?.data?.detail;
+        let msg = t("checkout_failed");
+        if (typeof detail === "string") {
+          msg = detail;
+        } else if (Array.isArray(detail)) {
+          msg = detail.map((d) => d.msg || JSON.stringify(d)).join(", ");
+        } else if (detail) {
+          msg = JSON.stringify(detail);
+        } else if (e?.message) {
+          msg = e.message;
+        }
+        toast.error(msg);
       }
     }
   }, [cart, subtotal, gst, total, discount, isOnline, settings, clear, refresh, customerName, t, cgst, cgstRate, menuMode, sgst, sgstRate]);
@@ -713,6 +819,8 @@ export default function Billing() {
                     <MenuTile
                       key={item.id}
                       item={item}
+                      menuMode={menuMode}
+                      gstRate={cgstRate + sgstRate}
                       onClick={() => addToCart(item)}
                     />
                   ))}
@@ -751,6 +859,8 @@ export default function Billing() {
                     <MenuTile
                       key={item.id}
                       item={item}
+                      menuMode={menuMode}
+                      gstRate={cgstRate + sgstRate}
                       onClick={() => addToCart(item)}
                     />
                   ))}
@@ -784,6 +894,8 @@ export default function Billing() {
                     <MenuTile
                       key={item.id}
                       item={item}
+                      menuMode={menuMode}
+                      gstRate={cgstRate + sgstRate}
                       onClick={() => addToCart(item)}
                     />
                   ))}
@@ -908,15 +1020,15 @@ export default function Billing() {
         <div className="p-4 border-t border-[#F5EFE6] bg-[#FFFDF9] space-y-3">
           <div className="space-y-2 text-xs text-slate-600">
             <div className="flex justify-between items-center">
-              <span className="font-medium text-slate-600">Subtotal</span>
+              <span className="font-medium text-slate-600">{isParcel ? "Subtotal (Incl. GST)" : "Subtotal"}</span>
               <span className="font-mono font-bold text-slate-800">₹{subtotal.toFixed(2)}</span>
             </div>
             <div className="flex justify-between items-center text-slate-500">
-              <span>CGST ({cgstRate}%)</span>
+              <span>CGST ({cgstRate}%{isParcel ? " incl." : ""})</span>
               <span className="font-mono">₹{cgst.toFixed(2)}</span>
             </div>
             <div className="flex justify-between items-center text-slate-500">
-              <span>SGST ({sgstRate}%)</span>
+              <span>SGST ({sgstRate}%{isParcel ? " incl." : ""})</span>
               <span className="font-mono">₹{sgst.toFixed(2)}</span>
             </div>
             <div className="flex justify-between items-center">

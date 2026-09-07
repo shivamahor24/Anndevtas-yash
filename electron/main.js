@@ -44,15 +44,15 @@ const LOG_DIR = path.join(app.getPath('userData'), 'logs');
 const DB_PATH = path.join(app.getPath('userData'), 'pos_data.db');
 
 // Bundled binaries
-const BACKEND_EXE  = getResourcePath('bin', 'backend.exe');
+const BACKEND_EXE = getResourcePath('bin', 'backend.exe');
 
 // React production build (index.html)
-const REACT_BUILD  = getResourcePath('build', 'index.html');
+const REACT_BUILD = getResourcePath('build', 'index.html');
 
 // Backend API
 const BACKEND_PORT = 8000;
-const BACKEND_URL  = `http://127.0.0.1:${BACKEND_PORT}`;
-const HEALTH_URL   = `${BACKEND_URL}/api/health`;
+const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
+const HEALTH_URL = `${BACKEND_URL}/api/health`;
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ function ensureDir(dir) {
 function logToFile(tag, data) {
   const logPath = path.join(LOG_DIR, 'electron.log');
   const line = `[${new Date().toISOString()}] [${tag}] ${data}\n`;
-  try { fs.appendFileSync(logPath, line); } catch (_) {}
+  try { fs.appendFileSync(logPath, line); } catch (_) { }
 }
 
 let backendErrorLogs = [];
@@ -150,7 +150,7 @@ async function startServices() {
         kill.on('error', resolve);
         setTimeout(resolve, 3000); // Safety timeout
       });
-    } catch (_) {}
+    } catch (_) { }
   }
 
   // Clear stale SQLite WAL lock files left by crashed previous sessions
@@ -324,7 +324,7 @@ function readSession() {
     }
   } catch (e) {
     logToFile('main', `Failed to read session file: ${e.message}. Resetting...`);
-    try { fs.writeFileSync(sessionFile, '{}', 'utf8'); } catch (_) {}
+    try { fs.writeFileSync(sessionFile, '{}', 'utf8'); } catch (_) { }
   }
   return {};
 }
@@ -390,11 +390,156 @@ ipcMain.handle('open-logs', () => {
 });
 
 // ─── Printer IPC Handlers for Thermal Paper Cutting ───────────────────────────
+async function resolvePrinter(requestedName) {
+  if (!mainWindow) return { error: "Main window is not available." };
+  let list = [];
+  try {
+    list = await mainWindow.webContents.getPrintersAsync();
+    logToFile('main', `getPrintersAsync found ${list.length} printer(s): ${JSON.stringify(list.map(p => ({ name: p.name, isDefault: p.isDefault })))}`);
+  } catch (e) {
+    logToFile('main', `Failed to get printers: ${e.message}`);
+    return { error: `Failed to detect installed printers: ${e.message}` };
+  }
+
+  if (!list || list.length === 0) {
+    logToFile('main', 'No installed printers found on system.');
+    return { error: "No installed printer found on system. Please connect a thermal printer." };
+  }
+
+  const cleanName = (requestedName || "").trim();
+  const isSystemDefaultReq = !cleanName || cleanName === "system_default" || cleanName.toLowerCase() === "system default";
+
+  if (isSystemDefaultReq) {
+    const defaultP = list.find(p => p.isDefault);
+    const chosen = defaultP ? defaultP.name : list[0].name;
+    logToFile('main', `Resolved 'system_default' to printer: '${chosen}'`);
+    return { printerName: chosen, isDefault: true };
+  }
+
+  const exact = list.find(p => p.name === cleanName);
+  if (exact) {
+    logToFile('main', `Resolved exact printer match: '${exact.name}'`);
+    return { printerName: exact.name, isDefault: exact.isDefault };
+  }
+
+  const ci = list.find(p => p.name.trim().toLowerCase() === cleanName.toLowerCase());
+  if (ci) {
+    logToFile('main', `Resolved case-insensitive printer match: '${ci.name}'`);
+    return { printerName: ci.name, isDefault: ci.isDefault };
+  }
+
+  // If specified printer not found, fallback to system default
+  const defaultP = list.find(p => p.isDefault);
+  const fallback = defaultP ? defaultP.name : list[0].name;
+  logToFile('main', `Requested printer '${cleanName}' not found in list. Falling back to '${fallback}'`);
+  return {
+    printerName: fallback,
+    isDefault: !!defaultP,
+    warning: `Selected printer '${cleanName}' was not found. Using '${fallback}' instead.`
+  };
+}
+
+function printHtmlWindow(html, targetDevice, paperWidth = 80) {
+  return new Promise((resolve) => {
+    // Strip any scripts that might call window.print or window.close
+    const cleanHtml = (html || '')
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+
+    const printWin = new BrowserWindow({
+      show: false,
+      width: 400,
+      height: 600,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        backgroundThrottling: false,
+      },
+    });
+
+    let didFinish = false;
+    let timer = null;
+
+    const cleanup = () => {
+      if (didFinish) return;
+      didFinish = true;
+      if (timer) clearTimeout(timer);
+      try {
+        if (printWin && !printWin.isDestroyed()) {
+          printWin.destroy();
+        }
+      } catch (_) {}
+    };
+
+    timer = setTimeout(() => {
+      if (!didFinish) {
+        logToFile('main', `Print job timed out for device: '${targetDevice}'`);
+        cleanup();
+        resolve({ success: false, error: "Print job timed out." });
+      }
+    }, 15000);
+
+    printWin.webContents.once('did-finish-load', () => {
+      setTimeout(() => {
+        if (didFinish || !printWin || printWin.isDestroyed()) return;
+
+        const is58 = Number(paperWidth) === 58;
+        const widthMicrons = is58 ? 58000 : 80000;
+
+        const printOptions = {
+          silent: true,
+          printBackground: true,
+          color: false,
+          margins: { marginType: 'none' },
+          pageSize: {
+            width: widthMicrons,
+            height: 300000,
+          },
+          scaleFactor: 100,
+        };
+
+        if (targetDevice && targetDevice !== "system_default" && targetDevice !== "System Default") {
+          printOptions.deviceName = targetDevice;
+        }
+
+        logToFile('main', `Sending print to deviceName: '${printOptions.deviceName || "System Default"}' with width: ${is58 ? "58mm" : "80mm"}`);
+
+        printWin.webContents.print(printOptions, (success, failureReason) => {
+          logToFile('main', `print result: success=${success}, reason=${failureReason}`);
+          cleanup();
+          if (success) {
+            resolve({ success: true, printerName: targetDevice || "System Default" });
+          } else {
+            resolve({
+              success: false,
+              error: failureReason || "Print job failed. Please check printer connection or driver.",
+              printerName: targetDevice,
+            });
+          }
+        });
+      }, 250);
+    });
+
+    printWin.webContents.on('did-fail-load', (e, errorCode, errorDescription) => {
+      logToFile('main', `Failed to load print template: ${errorDescription}`);
+      cleanup();
+      resolve({ success: false, error: `Failed to load print template: ${errorDescription}` });
+    });
+
+    printWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(cleanHtml)}`);
+  });
+}
+
+
 ipcMain.handle('printer:get-printers', async () => {
   if (!mainWindow) return [];
   try {
     const list = await mainWindow.webContents.getPrintersAsync();
-    return list.map(p => ({ name: p.name, isDefault: p.isDefault }));
+    return list.map(p => ({
+      name: p.name,
+      displayName: p.displayName || p.name,
+      isDefault: !!p.isDefault,
+      status: p.status
+    }));
   } catch (e) {
     logToFile('main', `Failed to get printers: ${e.message}`);
     return [];
@@ -402,86 +547,85 @@ ipcMain.handle('printer:get-printers', async () => {
 });
 
 ipcMain.handle('printer:print', async (event, { html, printerName, paperWidth }) => {
-  return new Promise((resolve) => {
-    let printWin = new BrowserWindow({
-      show: false,
-      webPreferences: { nodeIntegration: false, contextIsolation: true }
-    });
+  const resolution = await resolvePrinter(printerName);
+  if (resolution.error) {
+    return { success: false, error: resolution.error };
+  }
+  return await printHtmlWindow(html, resolution.printerName, paperWidth);
+});
 
-    printWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+ipcMain.handle('printer:print-parcel', async (event, { kitchenHTML, customerHTML, printerName, paperWidth }) => {
+  const resolution = await resolvePrinter(printerName);
+  if (resolution.error) {
+    return { success: false, error: resolution.error };
+  }
 
-    printWin.webContents.once('did-finish-load', () => {
-      const printOptions = {
-        silent: true,
-        printBackground: true,
-        margins: { marginType: 'none' },
-      };
-      if (printerName) {
-        printOptions.deviceName = printerName;
-      }
+  const targetDevice = resolution.printerName;
 
-      printWin.webContents.print(printOptions, (success, failureReason) => {
-        if (!success) {
-          logToFile('main', `Print failed: ${failureReason}`);
-        } else {
-          logToFile('main', 'Print job sent successfully');
-        }
-        try { printWin.close(); } catch (_) {}
-        printWin = null;
-        resolve(success);
-      });
-    });
-  });
+  const res1 = await printHtmlWindow(kitchenHTML, targetDevice, paperWidth);
+  if (!res1.success) {
+    return { success: false, error: `Kitchen coupon print failed: ${res1.error}` };
+  }
+
+  await new Promise(r => setTimeout(r, 600));
+
+  const res2 = await printHtmlWindow(customerHTML, targetDevice, paperWidth);
+  if (!res2.success) {
+    return { success: false, error: `Customer receipt print failed: ${res2.error}` };
+  }
+
+  return { success: true, printerName: targetDevice };
 });
 
 ipcMain.handle('printer:test-print', async (event, { printerName, paperWidth }) => {
+  const resolution = await resolvePrinter(printerName);
+  if (resolution.error) {
+    return { success: false, error: resolution.error };
+  }
+
+  const targetDevice = resolution.printerName;
   const is58 = Number(paperWidth) === 58;
   const widthStr = is58 ? "58mm" : "80mm";
+  const printableWidth = is58 ? "48mm" : "72mm";
   const testHTML = `<!doctype html>
 <html><head><meta charset="utf-8"/><title>Test Print</title>
 <style>
-  @page { size: ${widthStr} auto; margin: 0; }
-  body { font-family: monospace; font-size: 12px; padding: 10px; text-align: center; }
-  .receipt-cut-separator {
-    border-top: 2px dashed #000;
-    margin: 15px 0;
-    page-break-after: always;
-    break-after: page;
-  }
+  @page { size: ${widthStr} auto; margin: 0mm; }
+  * { box-sizing: border-box !important; margin: 0; padding: 0; }
+  html, body { width: 100%; max-width: ${printableWidth}; margin: 0; padding: 0; background: #fff; color: #000; font-family: 'Segoe UI', Arial, monospace; font-size: 12px; line-height: 1.35; }
+  .test-wrap { width: ${printableWidth}; max-width: ${printableWidth}; margin: 0; padding: 2mm 1.5mm 4mm 1.5mm; text-align: center; overflow: hidden; }
+  .receipt-row-table { width: 100% !important; table-layout: fixed !important; border-collapse: collapse !important; }
+  .cut-line { border-top: 1.5px dashed #000; margin: 4px 0; }
+  .paper-feed-end { height: 35px; }
 </style></head>
 <body>
-  <h3>ANNDEVTA POS</h3>
-  <p>Test Receipt</p>
-  <div class="receipt-cut-separator"></div>
-  <p>Test Token</p>
+  <div class="test-wrap">
+    <h3 style="margin:0 0 3px 0; font-size: 15px; font-weight: 800;">ANNDEVTA POS</h3>
+    <p style="margin:2px 0; font-weight: bold; font-size: 12px;">*** TEST PRINT SUCCESSFUL ***</p>
+    <div class="cut-line"></div>
+    <table class="receipt-row-table" style="font-size:11.5px; margin:2px 0;">
+      <tr>
+        <td style="width:46%; text-align:left; padding:1.5px 0;">Printer:</td>
+        <td style="width:54%; text-align:right; font-weight:bold; padding:1.5px 1px 1.5px 0; white-space:nowrap;">${targetDevice}</td>
+      </tr>
+      <tr>
+        <td style="width:46%; text-align:left; padding:1.5px 0;">Paper Width:</td>
+        <td style="width:54%; text-align:right; padding:1.5px 1px 1.5px 0; white-space:nowrap;">${widthStr} (${is58 ? "2 Inch" : "3 Inch"})</td>
+      </tr>
+      <tr>
+        <td style="width:46%; text-align:left; padding:1.5px 0;">Sample Total:</td>
+        <td style="width:54%; text-align:right; font-weight:800; font-size:14px; padding:1.5px 1px 1.5px 0; white-space:nowrap;">₹189.00</td>
+      </tr>
+    </table>
+    <div class="cut-line"></div>
+    <p style="margin:3px 0; font-size:11px;">RetSol RTP-80 Ready (72mm Active Width)</p>
+    <div class="paper-feed-end"></div>
+  </div>
 </body></html>`;
 
-  return new Promise((resolve) => {
-    let printWin = new BrowserWindow({
-      show: false,
-      webPreferences: { nodeIntegration: false, contextIsolation: true }
-    });
-
-    printWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(testHTML)}`);
-
-    printWin.webContents.once('did-finish-load', () => {
-      const printOptions = {
-        silent: true,
-        printBackground: true,
-        margins: { marginType: 'none' },
-      };
-      if (printerName) {
-        printOptions.deviceName = printerName;
-      }
-
-      printWin.webContents.print(printOptions, (success, failureReason) => {
-        try { printWin.close(); } catch (_) {}
-        printWin = null;
-        resolve(success);
-      });
-    });
-  });
+  return await printHtmlWindow(testHTML, targetDevice, paperWidth);
 });
+
 
 // ─── App lifecycle ───────────────────────────────────────────────────────────
 

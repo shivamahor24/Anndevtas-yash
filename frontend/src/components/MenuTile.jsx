@@ -2,7 +2,7 @@ import React from "react";
 import { Sparkles, Plus } from "lucide-react";
 import { useLanguage } from "../context/LanguageContext";
 
-function MenuTileComponent({ item, onClick }) {
+function MenuTileComponent({ item, onClick, menuMode = "dining", gstRate = 5.0, displayedPrice }) {
   const { t } = useLanguage();
 
   const stockColor =
@@ -11,6 +11,10 @@ function MenuTileComponent({ item, onClick }) {
       : item.current_stock <= (item.reorder_level || 10)
       ? "bg-amber-100 text-amber-700"
       : "bg-emerald-100 text-emerald-700";
+
+  const isParcel = menuMode === "parcel";
+  const rawPrice = Number(item.price || 0);
+  const priceToShow = displayedPrice !== undefined ? displayedPrice : rawPrice;
 
   return (
     <button
@@ -91,11 +95,14 @@ function MenuTileComponent({ item, onClick }) {
       {/* Bottom Price & Touch Add Button */}
       <div className="relative z-10 mt-auto flex w-full items-center justify-between pt-1 border-t border-dashed border-orange-100/80">
         <div>
-          <div className="text-[9px] uppercase tracking-[0.15em] text-slate-400 font-semibold">
-            Price
+          <div className="text-[9px] uppercase tracking-[0.15em] text-slate-400 font-semibold flex items-center gap-1">
+            <span>Price</span>
+            <span className={isParcel ? "text-amber-600 font-bold" : "text-slate-400"}>
+              {isParcel ? "(Incl. GST)" : "(Excl. GST)"}
+            </span>
           </div>
           <div className="text-[19px] sm:text-[21px] font-black tracking-tight text-brand-600 leading-tight">
-            ₹{item.price}
+            ₹{priceToShow}
           </div>
         </div>
 

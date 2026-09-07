@@ -43,7 +43,7 @@ from typing import List, Optional, Literal, Dict, Any
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from openpyxl import Workbook  # type: ignore
 
 
@@ -196,9 +196,12 @@ class LoginIn(BaseModel):
 
 
 class RestaurantSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str = "Thali House"
     address: str = ""
     gstin: str = ""
+    fssai: str = ""
     phone: str = ""
     gst_rate: float = 5.0
     cgst_rate: float = 2.5
@@ -216,6 +219,9 @@ class RestaurantSettings(BaseModel):
     receipt_padding: int = 6
     tax_label: str = "CGST & SGST"
     language: str = "en"
+    app_name: Optional[str] = "Anndevta"
+    app_tagline: Optional[str] = "THALI BILLING COUNTER"
+    default_printer: Optional[str] = "system_default"
     last_reset_date: Optional[str] = None
 
 
@@ -241,6 +247,8 @@ class MenuItemIn(BaseModel):
     portion_weight_kg: float = 0.0
     menuType: Optional[str] = None
     menu_type: Optional[str] = None
+    gst_enabled: bool = False
+    item_gst_rate: float = 0.0
 
 
 class TemplateIn(BaseModel):
@@ -275,9 +283,15 @@ class OrderItem(BaseModel):
 class OrderIn(BaseModel):
     items: List[OrderItem]
     discount: float = 0.0
-    payment_mode: Literal["cash", "card", "upi"] = "cash"
+    payment_mode: str = "cash"
     notes: str = ""
     token_no: Optional[int] = None
+    order_type: Optional[str] = "dining"
+    customer_name: Optional[str] = ""
+    customer_phone: Optional[str] = ""
+
+    class Config:
+        extra = "allow"
 
 
 # ------- Inventory Models -------
@@ -490,6 +504,8 @@ async def _create_tables(db: aiosqlite.Connection):
             barcode TEXT DEFAULT NULL,
             unit_cost REAL DEFAULT 0,
             location_id TEXT DEFAULT 'main',
+            gst_enabled INTEGER NOT NULL DEFAULT 0,
+            item_gst_rate REAL NOT NULL DEFAULT 0.0,
             PRIMARY KEY (id, tenant_db)
         );
 
@@ -509,6 +525,7 @@ async def _create_tables(db: aiosqlite.Connection):
             cashier_email TEXT DEFAULT '',
             cashier_name TEXT DEFAULT '',
             token_no INTEGER DEFAULT NULL,
+            order_type TEXT DEFAULT 'dining',
             PRIMARY KEY (id, tenant_db)
         );
 
@@ -779,9 +796,31 @@ async def _create_tables(db: aiosqlite.Connection):
         CREATE INDEX IF NOT EXISTS idx_inv_tx_created ON inventory_transactions(tenant_db, created_at);
         CREATE INDEX IF NOT EXISTS idx_stock_alerts_product ON stock_alerts(tenant_db, product_id);
         CREATE INDEX IF NOT EXISTS idx_menu_tenant ON menu(tenant_db);
-        CREATE INDEX IF NOT EXISTS idx_categories_tenant ON categories(tenant_db);
     """)
     await db.commit()
+
+    # Backward-compatible column migrations for existing databases
+    migration_statements = [
+        "ALTER TABLE orders ADD COLUMN order_type TEXT DEFAULT 'dining'",
+        "ALTER TABLE orders ADD COLUMN customer_name TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN customer_phone TEXT DEFAULT ''",
+        "ALTER TABLE menu ADD COLUMN gst_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE menu ADD COLUMN item_gst_rate REAL NOT NULL DEFAULT 0.0",
+        "ALTER TABLE menu ADD COLUMN current_stock REAL DEFAULT NULL",
+        "ALTER TABLE menu ADD COLUMN reorder_level INTEGER DEFAULT 10",
+        "ALTER TABLE menu ADD COLUMN min_stock INTEGER DEFAULT 5",
+        "ALTER TABLE menu ADD COLUMN max_stock INTEGER DEFAULT 1000",
+        "ALTER TABLE menu ADD COLUMN sku TEXT DEFAULT NULL",
+        "ALTER TABLE menu ADD COLUMN barcode TEXT DEFAULT NULL",
+        "ALTER TABLE menu ADD COLUMN unit_cost REAL DEFAULT 0",
+        "ALTER TABLE menu ADD COLUMN location_id TEXT DEFAULT 'main'",
+    ]
+    for stmt in migration_statements:
+        try:
+            await db.execute(stmt)
+            await db.commit()
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -882,7 +921,7 @@ async def signup(body: SignupIn):
     settings_data = {
         "id": "restaurant",
         "name": body.restaurant_name,
-        "address": "", "gstin": "", "phone": "", "gst_rate": 5.0, "cgst_rate": 2.5, "sgst_rate": 2.5,
+        "address": "", "gstin": "", "fssai": "", "phone": "", "gst_rate": 5.0, "cgst_rate": 2.5, "sgst_rate": 2.5,
         "footer_msg": "Thank you for dining with us!",
         "auto_print": False, "tax_label": "CGST & SGST", "language": "en"
     }
@@ -1256,6 +1295,8 @@ def _menu_row_to_dict(row: dict) -> dict:
     row["thali_groups"] = _parse_json(row.get("thali_groups"), [])
     row["available"] = bool(row.get("available"))
     row["is_thali"] = bool(row.get("is_thali"))
+    row["gst_enabled"] = bool(row.get("gst_enabled"))
+    row["item_gst_rate"] = float(row.get("item_gst_rate") or 0.0)
     return row
 
 
@@ -1308,12 +1349,13 @@ async def create_menu(body: MenuItemIn, _: dict = Depends(require_roles("admin")
     obj["menu_type"] = m_type
     await _execute(db,
         """INSERT INTO menu (id, tenant_db, name, category_id, price, available, is_thali, thali_groups, thali_extras,
-           portion_weight_kg, menuType, menu_type)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           portion_weight_kg, menuType, menu_type, gst_enabled, item_gst_rate)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (obj["id"], tenant, obj["name"], obj["category_id"], obj["price"],
          1 if obj["available"] else 0, 1 if obj["is_thali"] else 0,
          _to_json([g.model_dump() for g in body.thali_groups]),
-         obj["thali_extras"], obj["portion_weight_kg"], obj["menuType"], obj["menu_type"]))
+         obj["thali_extras"], obj["portion_weight_kg"], obj["menuType"], obj["menu_type"],
+         1 if obj.get("gst_enabled") else 0, float(obj.get("item_gst_rate") or 0)))
     obj["thali_groups"] = [g.model_dump() for g in body.thali_groups]
     return obj
 
@@ -1328,11 +1370,12 @@ async def update_menu(mid: str, body: MenuItemIn, _: dict = Depends(require_role
     data["menu_type"] = m_type
     await _execute(db,
         """UPDATE menu SET name=?, category_id=?, price=?, available=?, is_thali=?, thali_groups=?, thali_extras=?,
-           portion_weight_kg=?, menuType=?, menu_type=? WHERE id=? AND tenant_db=?""",
+           portion_weight_kg=?, menuType=?, menu_type=?, gst_enabled=?, item_gst_rate=? WHERE id=? AND tenant_db=?""",
         (data["name"], data["category_id"], data["price"],
          1 if data["available"] else 0, 1 if data["is_thali"] else 0,
          _to_json(data["thali_groups"]), data["thali_extras"],
          data["portion_weight_kg"], data["menuType"], data["menu_type"],
+         1 if data.get("gst_enabled") else 0, float(data.get("item_gst_rate") or 0),
          mid, tenant))
     updated = await _fetchone(db, "SELECT * FROM menu WHERE id = ? AND tenant_db = ?", (mid, tenant))
     if updated:
@@ -1418,21 +1461,67 @@ async def delete_template(tid: str, _: dict = Depends(require_roles("admin"))):
 
 
 # ------- Orders -------
-def _compute_totals(items: list, discount: float, default_cgst_rate: float = 2.5, default_sgst_rate: float = 2.5) -> dict:
-    subtotal = sum((i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"]) for i in items)
-    cgst = sum(((i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"])) * (i.get("cgst_rate", default_cgst_rate) / 100) for i in items)
-    sgst = sum(((i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"])) * (i.get("sgst_rate", default_sgst_rate) / 100) for i in items)
-    cgst = round(cgst, 2)
-    sgst = round(sgst, 2)
-    tax = round(cgst + sgst, 2)
-    total = max(0.0, round(subtotal + tax - discount, 2))
-    return {
-        "subtotal": round(subtotal, 2),
-        "cgst": cgst,
-        "sgst": sgst,
-        "tax": tax,
-        "total": total,
-    }
+def _compute_totals(items: list, discount: float, default_cgst_rate: float = 2.5, default_sgst_rate: float = 2.5, order_type: str = "dining") -> dict:
+    is_parcel = (order_type or "").lower() == "parcel"
+    gross_total = sum((i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"]) for i in items)
+
+    if is_parcel:
+        # Parcel: Item prices are GST INCLUSIVE.
+        # Extract GST from the gross price: Base = Gross / (1 + total_rate/100), GST = Gross - Base
+        cgst = 0.0
+        sgst = 0.0
+        taxable_subtotal = 0.0
+
+        for i in items:
+            line_gross = (i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"])
+            c_rate = i.get("cgst_rate", default_cgst_rate)
+            s_rate = i.get("sgst_rate", default_sgst_rate)
+            total_rate = c_rate + s_rate
+            if total_rate > 0:
+                base = line_gross / (1 + total_rate / 100)
+                item_tax = line_gross - base
+                item_cgst = item_tax * (c_rate / total_rate)
+                item_sgst = item_tax * (s_rate / total_rate)
+            else:
+                base = line_gross
+                item_cgst = 0.0
+                item_sgst = 0.0
+            taxable_subtotal += base
+            cgst += item_cgst
+            sgst += item_sgst
+
+        cgst = round(cgst, 2)
+        sgst = round(sgst, 2)
+        tax = round(cgst + sgst, 2)
+        total = max(0.0, round(gross_total - discount, 2))
+
+        return {
+            "subtotal": round(gross_total, 2),
+            "taxable_subtotal": round(taxable_subtotal, 2),
+            "cgst": cgst,
+            "sgst": sgst,
+            "tax": tax,
+            "total": total,
+        }
+    else:
+        # Dine-In: Item prices are GST EXCLUSIVE.
+        # Add GST on top of base subtotal: CGST = Base * 2.5%, SGST = Base * 2.5%
+        cgst = sum(((i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"])) * (i.get("cgst_rate", default_cgst_rate) / 100) for i in items)
+        sgst = sum(((i["price"] * i["qty"]) + ((i.get("extra_bread_charge") or 0) * i["qty"])) * (i.get("sgst_rate", default_sgst_rate) / 100) for i in items)
+        cgst = round(cgst, 2)
+        sgst = round(sgst, 2)
+        tax = round(cgst + sgst, 2)
+        total = max(0.0, round(gross_total + tax - discount, 2))
+
+        return {
+            "subtotal": round(gross_total, 2),
+            "taxable_subtotal": round(gross_total, 2),
+            "cgst": cgst,
+            "sgst": sgst,
+            "tax": tax,
+            "total": total,
+        }
+
 
 
 async def _next_receipt_number() -> int:
@@ -1440,12 +1529,15 @@ async def _next_receipt_number() -> int:
     tenant = _tenant()
     row = await _fetchone(db, "SELECT value FROM counters WHERE id = ? AND tenant_db = ?", ("receipt", tenant))
     if row:
-        new_val = row["value"] + 1
+        new_val = int(row["value"]) + 1
         await _execute(db, "UPDATE counters SET value = ? WHERE id = ? AND tenant_db = ?", (new_val, "receipt", tenant))
         return new_val
     else:
-        await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, 1))
-        return 1
+        max_order = await _fetchone(db, "SELECT MAX(receipt_no) as max_rn FROM orders WHERE tenant_db = ?", (tenant,))
+        max_rn = int(max_order["max_rn"]) if max_order and max_order["max_rn"] is not None else 0
+        new_val = max_rn + 1
+        await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, new_val))
+        return new_val
 
 
 @api.post("/orders")
@@ -1471,7 +1563,8 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
         if item.get("tax_rate") is None or item.get("tax_rate") == 5.0:
             item["tax_rate"] = item["cgst_rate"] + item["sgst_rate"]
 
-    totals = _compute_totals(items, body.discount, default_cgst, default_sgst)
+    order_type = (body.order_type or "dining").lower()
+    totals = _compute_totals(items, body.discount, default_cgst, default_sgst, order_type)
     rn = await _next_receipt_number()
     ts = iso(now_utc())
     order = {
@@ -1488,20 +1581,24 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
         "total": totals["total"],
         "payment_mode": body.payment_mode,
         "notes": body.notes,
+        "customer_name": getattr(body, "customer_name", "") or "",
+        "customer_phone": getattr(body, "customer_phone", "") or "",
         "created_at": ts,
         "paid_at": ts,
         "cashier_email": user.get("email"),
         "cashier_name": user.get("name"),
         "token_no": body.token_no,
+        "order_type": order_type,
     }
     await _execute(db,
         """INSERT INTO orders (id, tenant_db, receipt_no, items, subtotal, tax, discount, total, payment_mode, notes,
-           created_at, paid_at, cashier_email, cashier_name, token_no)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           created_at, paid_at, cashier_email, cashier_name, token_no, order_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (order["id"], tenant, order["receipt_no"], _to_json(order["items"]),
          order["subtotal"], order["tax"], order["discount"], order["total"],
          order["payment_mode"], order["notes"], order["created_at"], order["paid_at"],
-         order["cashier_email"], order["cashier_name"], order["token_no"]))
+         order["cashier_email"], order["cashier_name"], order["token_no"], order["order_type"]))
+
 
     # --- Inventory hook: decrement stock for each sold item ---
     for item in items:
@@ -1614,6 +1711,7 @@ async def reset_orders_reset_path(_: dict = Depends(get_current_user)):
     db = await get_db()
     tenant = _tenant()
     await _execute(db, "DELETE FROM orders WHERE tenant_db = ?", (tenant,))
+    await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
     return {"ok": True, "message": "All order records deleted"}
 
 
@@ -1622,6 +1720,7 @@ async def reset_orders_root_path(_: dict = Depends(get_current_user)):
     db = await get_db()
     tenant = _tenant()
     await _execute(db, "DELETE FROM orders WHERE tenant_db = ?", (tenant,))
+    await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
     return {"ok": True, "message": "All order records deleted"}
 
 
@@ -1635,6 +1734,9 @@ async def delete_order(oid: str, user: dict = Depends(get_current_user)):
     if not order:
         raise HTTPException(404, "Order not found")
     await _execute(db, "DELETE FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    remaining = await _fetchone(db, "SELECT COUNT(*) as count FROM orders WHERE tenant_db = ?", (tenant,))
+    if remaining and remaining["count"] == 0:
+        await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
     return {"ok": True, "id": oid}
 
 
@@ -1917,6 +2019,7 @@ async def _seed_settings():
         "name": "Anndevta Thali House",
         "address": "12, MG Road, Bengaluru 560001",
         "gstin": "29ABCDE1234F1Z5",
+        "fssai": "",
         "phone": "+91 98765 43210",
         "gst_rate": 5.0,
         "footer_msg": "Thank you! Please visit again.",

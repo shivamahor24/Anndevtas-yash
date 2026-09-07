@@ -1,7 +1,9 @@
-// Customer receipt printer (80mm / 300px thermal POS compatible)
+// Customer receipt printer (80mm / 58mm thermal POS compatible)
+// Specifically optimized for RetSol RTP-80 80mm Thermal Receipt Printer (72mm active printhead / 576 dots)
 import en from "../translations/en.json";
 import gu from "../translations/gu.json";
 import bilingual from "../translations/bilingual.json";
+import { toast } from "sonner";
 
 const translations = { en, gu, bilingual };
 
@@ -138,181 +140,6 @@ function getGroupedThaliItems(selections, extras, t) {
   return getItemSubItems({ thali_selections: selections, thali_extras: extras }, t);
 }
 
-// function buildReceiptBlock({ order, settings, t, tokenNo, receiptNoFormatted, dateStr, timeStr, safe, menu }) {
-//   const cgstRate = order.cgst_rate ?? settings?.cgst_rate ?? ((settings?.gst_rate ?? 5.0) / 2);
-//   const sgstRate = order.sgst_rate ?? settings?.sgst_rate ?? ((settings?.gst_rate ?? 5.0) / 2);
-//   const cgstVal = order.cgst ?? (Number(order.subtotal || 0) * (cgstRate / 100));
-//   const sgstVal = order.sgst ?? (Number(order.subtotal || 0) * (sgstRate / 100));
-//   const taxLabel = settings?.tax_label || 'CGST & SGST';
-
-//   // Center aligned header
-//   let headerHTML = '';
-//   if (settings?.header_template === 'compact') {
-//     headerHTML = `
-//       <div style="font-weight: bold; font-size: 14px; text-transform: uppercase; margin-bottom: 2px;">${safe(settings?.name || 'ANNDEVTA THALI HOUSE')}</div>
-//       ${settings?.phone ? `<div style="font-size: 11px; margin: 1px 0;">PH: ${safe(settings.phone)}</div>` : ''}
-//     `;
-//   } else if (settings?.header_template === 'modern') {
-//     headerHTML = `
-//       <div style="margin-bottom: 4px;">
-//         <span style="border: 1px solid #000; padding: 1px 5px; font-weight: bold; font-size: 11px; background-color: #000; color: #fff; border-radius: 2px;">ΨΦ</span>
-//       </div>
-//       <div style="font-weight: bold; font-size: 14px; text-transform: uppercase; margin-bottom: 2px;">${safe(settings?.name || 'ANNDEVTA THALI HOUSE')}</div>
-//       ${settings?.address ? `<div style="font-size: 11px; margin: 1px 0;">${safe(settings.address)}</div>` : ''}
-//     `;
-//   } else { // classic (default)
-//     headerHTML = `
-//       <div style="font-weight: bold; font-size: 14px; text-transform: uppercase; margin-bottom: 2px;">${safe(settings?.name || 'ANNDEVTA THALI HOUSE')}</div>
-//       ${settings?.address ? `<div style="font-size: 11px; margin: 1px 0;">${safe(settings.address)}</div>` : ''}
-//       ${settings?.phone ? `<div style="font-size: 11px; margin: 1px 0;">PH: ${safe(settings.phone)}</div>` : ''}
-//       ${settings?.gstin ? `<div style="font-size: 11px; margin: 1px 0;">GSTIN: ${safe(settings.gstin)}</div>` : ''}
-//     `;
-//   }
-
-//   const itemsHTML = (order.items || []).map((i) => {
-//     const lineTotal = (i.price * i.qty).toFixed(2);
-//     const subItems = getItemSubItems(i, t, menu);
-//     const subline = subItems.map((sel) => `• ${safe(sel)}`);
-
-//     return `
-//       <div style="margin-bottom: 6px;">
-//         <div style="display: flex; justify-content: space-between; font-weight: bold;">
-//           <span>${safe(t(i.name))}</span>
-//           <span>Rs.${lineTotal}</span>
-//         </div>
-//         <div style="display: flex; justify-content: space-between; font-size: 11px; color: #333;">
-//           <span>${i.qty} x Rs.${Number(i.price).toFixed(2)}</span>
-//         </div>
-//         ${subline.length > 0 ? `
-//         <div style="font-size: 10px; color: #555; padding-left: 10px; margin-top: 2px; line-height: 1.3;">
-//           ${subline.join('<br/>')}
-//         </div>` : ''}
-//       </div>
-//     `;
-//   }).join('');
-
-//   const pm = order.payment_mode || 'cash';
-//   const pmTranslated = pm === 'cash' ? t('cash') : pm === 'upi' ? t('upi') : pm === 'card' ? t('card') : pm;
-
-//   const cashierName = order.cashier_name;
-//   const cashierTranslated = cashierName === 'Owner' ? t('owner') : cashierName === 'Cashier' ? t('cashier') : cashierName;
-
-//   let footerMessage = settings?.footer_msg;
-//   if (!footerMessage || footerMessage === "Thank you! Please visit again." || footerMessage === "Thank you for dining with us!") {
-//     footerMessage = `${t("thank_you")}! ${t("visit_again")}`;
-//   }
-
-//   return `
-//   <div class="receipt-container">
-//     <!-- Header Section -->
-//     <div style="text-align: center;">
-//       ${headerHTML}
-//     </div>
-    
-//     <!-- Thin Divider -->
-//     <div class="separator-solid"></div>
-    
-//     <!-- Bill Info Section -->
-//     <div class="bill-info">
-//       ${tokenNo !== undefined && tokenNo !== null ? `
-//       <div class="info-row">
-//         <span>Token No:</span>
-//         <span style="font-weight: bold;">#${tokenNo}</span>
-//       </div>` : ''}
-//       <div class="info-row">
-//         <span>${t("bill_no")}:</span>
-//         <span>${receiptNoFormatted}</span>
-//       </div>
-//       <div class="info-row">
-//         <span>${t("date")}:</span>
-//         <span>${dateStr}</span>
-//       </div>
-//       <div class="info-row">
-//         <span>${t("time")}:</span>
-//         <span>${timeStr}</span>
-//       </div>
-//       ${order.cashier_name ? `
-//       <div class="info-row">
-//         <span>${t("cashier")}:</span>
-//         <span>${safe(cashierTranslated)}</span>
-//       </div>` : ''}
-//       ${order.customer_name ? `
-//       <div class="info-row">
-//         <span>${t("customer")}:</span>
-//         <span>${safe(order.customer_name)}</span>
-//       </div>` : ''}
-//     </div>
-    
-//     <!-- Items Title Header -->
-//     <div class="separator-dashed"></div>
-//     <div style="text-align: center; font-weight: bold; letter-spacing: 1px; font-size: 11px;">ITEMS</div>
-//     <div class="separator-dashed"></div>
-    
-//     <!-- Items Section -->
-//     <div>
-//       ${itemsHTML}
-//     </div>
-    
-//     <!-- Pricing Section -->
-//     <div class="separator-dashed"></div>
-    
-//     <div class="summary-row">
-//       <span>${t("subtotal")}</span>
-//       <span>Rs.${Number(order.subtotal || 0).toFixed(2)}</span>
-//     </div>
-    
-//     ${settings?.show_gst !== false ? `
-//     <div class="summary-row">
-//       <span>CGST (${cgstRate}%)</span>
-//       <span>Rs.${Number(cgstVal).toFixed(2)}</span>
-//     </div>
-//     <div class="summary-row">
-//       <span>SGST (${sgstRate}%)</span>
-//       <span>Rs.${Number(sgstVal).toFixed(2)}</span>
-//     </div>` : ''}
-    
-//     ${order.discount > 0 ? `
-//     <div class="summary-row" style="color: #d32f2f;">
-//       <span>${t("discount")}</span>
-//       <span>-Rs.${Number(order.discount).toFixed(2)}</span>
-//     </div>` : ''}
-    
-//     <div class="separator-dashed"></div>
-//     <div class="summary-row total-row">
-//       <span>${t("total_uppercase")}</span>
-//       <span>Rs.${Number(order.total || 0).toFixed(2)}</span>
-//     </div>
-//     <div class="separator-dashed"></div>
-    
-//     <!-- Payment Info -->
-//     ${settings?.show_payment !== false ? `
-//     <div class="info-row" style="font-weight: bold;">
-//       <span>${t("payment")}:</span>
-//       <span>${safe(pmTranslated.toUpperCase())}</span>
-//     </div>
-//     <div class="separator-dashed"></div>
-//     ` : ''}
-    
-//     <!-- Footer Section -->
-//     <div style="text-align: center; font-weight: bold; text-transform: uppercase; margin-top: 6px; font-size: 11px;">
-//       ${safe(footerMessage.toUpperCase())}
-//     </div>
-    
-//     <div style="text-align: center; font-size: 10px; color: #444; margin-top: 4px;">
-//       ${dateStr} ${timeStr}
-//     </div>
-    
-//     <div class="separator-dashed" style="margin-top: 8px;"></div>
-    
-//     <div style="text-align: center; font-size: 9px; color: #666; margin-top: 6px;">
-//       <div style="font-weight: 600;">Powered by Career Craftly</div>
-//       <div style="margin-top: 1px; font-size: 9px;">Crafting Digital Success, Intelligently</div>
-//     </div>
-//     <div class="separator-solid" style="margin-top: 8px;"></div>
-//   </div>
-//   `;
-// }
-
 function buildReceiptBlock({
   order,
   settings,
@@ -322,8 +149,10 @@ function buildReceiptBlock({
   dateStr,
   timeStr,
   safe,
-  menu
+  menu,
+  menuMode
 }) {
+  const isParcelOrder = (order?.order_type === "parcel") || (menuMode === "parcel");
   const cgstRate =
     order.cgst_rate ??
     settings?.cgst_rate ??
@@ -334,124 +163,147 @@ function buildReceiptBlock({
     settings?.sgst_rate ??
     ((settings?.gst_rate ?? 5.0) / 2);
 
-  const cgstVal =
-    order.cgst ??
-    (Number(order.subtotal || 0) * (cgstRate / 100));
+  const subtotalVal = Number(order.subtotal || 0) || (order.items || []).reduce((sum, item) => sum + (Number(item.price || 0) * Number(item.qty || 1)), 0);
+  const discountVal = Number(order.discount || 0);
 
-  const sgstVal =
-    order.sgst ??
-    (Number(order.subtotal || 0) * (sgstRate / 100));
+  let cgstVal = order.cgst;
+  let sgstVal = order.sgst;
+
+  if (cgstVal === undefined || sgstVal === undefined) {
+    const totalRate = cgstRate + sgstRate;
+    if (isParcelOrder) {
+      if (totalRate > 0) {
+        const base = subtotalVal / (1 + totalRate / 100);
+        const taxAmt = subtotalVal - base;
+        cgstVal = taxAmt * (cgstRate / totalRate);
+        sgstVal = taxAmt * (sgstRate / totalRate);
+      } else {
+        cgstVal = 0;
+        sgstVal = 0;
+      }
+    } else {
+      cgstVal = subtotalVal * (cgstRate / 100);
+      sgstVal = subtotalVal * (sgstRate / 100);
+    }
+  }
+
+  let finalTotal;
+  if (isParcelOrder) {
+    finalTotal = Math.max(0, subtotalVal - discountVal);
+  } else if (order.total !== undefined && order.total !== null) {
+    finalTotal = Number(order.total);
+  } else {
+    finalTotal = Math.max(0, subtotalVal + Number(cgstVal || 0) + Number(sgstVal || 0) - discountVal);
+  }
+
+  const formatAddressHTML = (addr) => {
+    if (!addr) return "";
+    return String(addr)
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(l => safe(l))
+      .join("<br/>");
+  };
 
   // HEADER
   let headerHTML = "";
+  let alignStyle = "center";
+  if (settings?.header_alignment === "left") {
+    alignStyle = "left";
+  } else if (settings?.header_alignment === "right") {
+    alignStyle = "right";
+  }
 
   if (settings?.header_template === "compact") {
     headerHTML = `
-      <div style="
-        font-weight:bold;
-        font-size:14px;
-        letter-spacing:.025em;
-        text-transform:uppercase;
-        margin-bottom:2px;
-      ">
+      <div style="font-weight:800;font-size:15px;letter-spacing:0.02em;text-transform:uppercase;text-align:${alignStyle};margin-bottom:2px;">
         ${safe(settings?.name || "ANNDEVTA THALI HOUSE")}
       </div>
-
-      ${
-        settings?.phone
-          ? `<div style="font-size:11px;color:#333;">
-              PH: ${safe(settings.phone)}
+      ${settings?.phone && String(settings.phone).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};margin-bottom:1px;">PH: ${safe(String(settings.phone).trim())}</div>`
+        : ""
+      }
+      ${settings?.gstin && String(settings.gstin).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};">
+              GSTIN: ${safe(String(settings.gstin).trim())}
             </div>`
-          : ""
+        : ""
+      }
+      ${settings?.fssai && String(settings.fssai).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};">
+              FSSAI: ${safe(String(settings.fssai).trim())}
+            </div>`
+        : ""
       }
     `;
   } else if (settings?.header_template === "modern") {
+    const badgeAlign = alignStyle === "left" ? "left" : alignStyle === "right" ? "right" : "center";
     headerHTML = `
-      <div style="margin-bottom:4px;text-align:center;">
-        <span style="
-          border:1px solid #000;
-          padding:2px 6px;
-          font-weight:bold;
-          letter-spacing:.05em;
-          font-size:11px;
-          background:#000;
-          color:#fdfbf7;
-          border-radius:2px;
-        ">
-          ΨΦ
-        </span>
+      <div style="text-align:${badgeAlign};margin-bottom:4px;">
+        <span style="border:1px solid #000;padding:1px 6px;font-weight:bold;letter-spacing:1px;font-size:11px;background:#000;color:#fff;border-radius:2px;display:inline-block;">ΨΦ</span>
       </div>
-
-      <div style="
-        font-weight:bold;
-        font-size:14px;
-        letter-spacing:.025em;
-        text-transform:uppercase;
-        margin-bottom:2px;
-      ">
+      <div style="font-weight:800;font-size:15px;letter-spacing:0.02em;text-transform:uppercase;text-align:${alignStyle};margin-bottom:2px;">
         ${safe(settings?.name || "ANNDEVTA THALI HOUSE")}
       </div>
-
-      ${
-        settings?.address
-          ? `<div style="
-              font-size:11px;
-              color:#333;
-              white-space:pre-wrap;
-            ">
-              ${safe(settings.address)}
+      ${settings?.address && String(settings.address).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};line-height:1.3;margin:2px auto;">
+              ${formatAddressHTML(settings.address)}
             </div>`
-          : ""
+        : ""
+      }
+      ${settings?.phone && String(settings.phone).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};margin-bottom:1px;">
+              PH: ${safe(String(settings.phone).trim())}
+            </div>`
+        : ""
+      }
+      ${settings?.gstin && String(settings.gstin).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};">
+              GSTIN: ${safe(String(settings.gstin).trim())}
+            </div>`
+        : ""
+      }
+      ${settings?.fssai && String(settings.fssai).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};">
+              FSSAI: ${safe(String(settings.fssai).trim())}
+            </div>`
+        : ""
       }
     `;
   } else {
     headerHTML = `
-      <div style="
-        font-weight:bold;
-        font-size:14px;
-        letter-spacing:.025em;
-        text-transform:uppercase;
-        margin-bottom:2px;
-      ">
+      <div style="font-weight:800;font-size:15px;letter-spacing:0.02em;text-transform:uppercase;text-align:${alignStyle};margin-bottom:2px;">
         ${safe(settings?.name || "ANNDEVTA THALI HOUSE")}
       </div>
-
-      ${
-        settings?.address
-          ? `<div style="
-              font-size:11px;
-              color:#333;
-              white-space:pre-wrap;
-              margin-bottom:2px;
-            ">
-              ${safe(settings.address)}
+      ${settings?.address && String(settings.address).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};line-height:1.3;margin:2px auto;">
+              ${formatAddressHTML(settings.address)}
             </div>`
-          : ""
+        : ""
       }
-
-      ${
-        settings?.phone
-          ? `<div style="
-              font-size:11px;
-              color:#333;
-              margin-bottom:2px;
-            ">
-              PH: ${safe(settings.phone)}
+      ${settings?.phone && String(settings.phone).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};margin-bottom:1px;">
+              PH: ${safe(String(settings.phone).trim())}
             </div>`
-          : ""
+        : ""
       }
-
-      ${
-        settings?.gstin
-          ? `<div style="font-size:11px;color:#333;">
-              GSTIN: ${safe(settings.gstin)}
+      ${settings?.gstin && String(settings.gstin).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};">
+              GSTIN: ${safe(String(settings.gstin).trim())}
             </div>`
-          : ""
+        : ""
+      }
+      ${settings?.fssai && String(settings.fssai).trim()
+        ? `<div style="font-size:11.5px;color:#000;text-align:${alignStyle};">
+              FSSAI: ${safe(String(settings.fssai).trim())}
+            </div>`
+        : ""
       }
     `;
   }
 
-  // ITEMS
+  // ITEMS (Full usable 72mm width 2-column table layout)
   const itemsHTML = (order.items || [])
     .map((i) => {
       const lineTotal = (
@@ -460,51 +312,36 @@ function buildReceiptBlock({
       ).toFixed(2);
 
       const subItems = getItemSubItems(i, t, menu);
-
       const subline = subItems.map(
         (sel) => `• ${safe(sel)}`
       );
 
       return `
-        <div style="margin-bottom:6px;">
-
-          <div style="
-            display:flex;
-            justify-content:space-between;
-            font-weight:bold;
-          ">
-            <span>${safe(t(i.name))}</span>
-            <span>Rs.${lineTotal}</span>
-          </div>
-
-          <div style="
-            display:flex;
-            justify-content:space-between;
-            font-size:11px;
-            color:#333;
-          ">
-            <span>
-              ${i.qty} x Rs.${Number(i.price).toFixed(2)}
-            </span>
-          </div>
-
-          ${
-            subline.length > 0
-              ? `
-                <div style="
-                  font-size:10px;
-                  color:#555;
-                  padding-left:10px;
-                  margin-top:2px;
-                  line-height:1.25;
-                ">
-                  ${subline.join("<br/>")}
-                </div>
+        <table class="receipt-row-table" style="margin-bottom:4px;">
+          <tr>
+            <td style="width:64%;text-align:left;vertical-align:top;font-weight:bold;font-size:12.5px;padding-right:4px;word-break:break-word;">
+              ${safe(t(i.name))}
+            </td>
+            <td style="width:36%;text-align:right;vertical-align:top;font-weight:bold;font-size:12.5px;padding-right:1px;white-space:nowrap;font-variant-numeric:tabular-nums;">
+              ₹${lineTotal}
+            </td>
+          </tr>
+          <tr>
+            <td colspan="2" style="text-align:left;font-size:11px;color:#111;padding:0 0 1px 0;">
+              ${i.qty} x ₹${Number(i.price).toFixed(2)}
+            </td>
+          </tr>
+          ${subline.length > 0
+          ? `
+                <tr>
+                  <td colspan="2" style="text-align:left;font-size:10.5px;color:#333;padding-left:6px;line-height:1.25;">
+                    ${subline.join("<br/>")}
+                  </td>
+                </tr>
               `
-              : ""
-          }
-
-        </div>
+          : ""
+        }
+        </table>
       `;
     })
     .join("");
@@ -514,148 +351,153 @@ function buildReceiptBlock({
     <div class="receipt-container">
 
       <!-- HEADER -->
-      <div style="text-align:center;">
+      <div style="text-align:${alignStyle};width:100%;">
         ${headerHTML}
       </div>
 
       <div class="separator-solid"></div>
 
-      <!-- BILL INFO -->
-      <div class="bill-info">
+      <!-- BILL INFO TABLE -->
+      <table class="receipt-row-table" style="font-size:11.5px;margin:2px 0;">
+        <tr>
+          <td style="width:46%;text-align:left;font-weight:bold;padding:1px 0;">Order Type:</td>
+          <td style="width:54%;text-align:right;font-weight:bold;padding:1px 1px 1px 0;white-space:nowrap;">
+            ${(order.order_type === "parcel") ? "PARCEL / TAKEAWAY" : "DINE-IN"}
+          </td>
+        </tr>
 
-        ${
-          tokenNo !== undefined && tokenNo !== null
-            ? `
-              <div class="info-row">
-                <span>Token No:</span>
-                <span style="font-weight:bold;">
+        ${tokenNo !== undefined && tokenNo !== null
+      ? `
+              <tr>
+                <td style="width:46%;text-align:left;font-weight:bold;font-size:12.5px;padding:2px 0;">Token No:</td>
+                <td style="width:54%;text-align:right;font-weight:900;font-size:16px;padding:2px 1px 2px 0;white-space:nowrap;">
                   #${tokenNo}
-                </span>
-              </div>
+                </td>
+              </tr>
             `
-            : ""
-        }
+      : ""
+    }
 
-        <div class="info-row">
-          <span>${t("bill_no")}:</span>
-          <span>${receiptNoFormatted}</span>
-        </div>
+        <tr>
+          <td style="width:46%;text-align:left;padding:1px 0;">${t("bill_no")}:</td>
+          <td style="width:54%;text-align:right;font-weight:bold;padding:1px 1px 1px 0;white-space:nowrap;">
+            ${receiptNoFormatted}
+          </td>
+        </tr>
 
-        <div class="info-row">
-          <span>${dateStr}</span>
-          <span>${timeStr}</span>
-        </div>
+        <tr>
+          <td style="width:50%;text-align:left;padding:1px 0;">${dateStr}</td>
+          <td style="width:50%;text-align:right;padding:1px 1px 1px 0;white-space:nowrap;">${timeStr}</td>
+        </tr>
 
-        ${
-          order.customer_name
-            ? `
-              <div class="info-row">
-                <span>${t("customer")}:</span>
-                <span>${safe(order.customer_name)}</span>
-              </div>
+        ${order.customer_name
+      ? `
+              <tr>
+                <td style="width:35%;text-align:left;padding:1px 0;">${t("customer")}:</td>
+                <td style="width:65%;text-align:right;padding:1px 1px 1px 0;word-break:break-word;">
+                  ${safe(order.customer_name)}
+                </td>
+              </tr>
             `
-            : ""
-        }
+      : ""
+    }
 
-        ${
-          order.customer_phone
-            ? `
-              <div class="info-row">
-                <span>${t("phone")}:</span>
-                <span>${safe(order.customer_phone)}</span>
-              </div>
+        ${order.customer_phone
+      ? `
+              <tr>
+                <td style="width:35%;text-align:left;padding:1px 0;">${t("phone")}:</td>
+                <td style="width:65%;text-align:right;padding:1px 1px 1px 0;white-space:nowrap;">
+                  ${safe(order.customer_phone)}
+                </td>
+              </tr>
             `
-            : ""
-        }
-
-      </div>
+      : ""
+    }
+      </table>
 
       <!-- ITEMS HEADER -->
       <div class="separator-dashed"></div>
 
-      <div style="
-        text-align:center;
-        font-weight:bold;
-        letter-spacing:1px;
-        font-size:11px;
-      ">
+      <div style="text-align:center;font-weight:bold;letter-spacing:1px;font-size:11.5px;width:100%;">
         ITEMS
       </div>
 
       <div class="separator-dashed"></div>
 
-      <!-- ITEMS -->
-      <div>
+      <!-- ITEMS LIST -->
+      <div style="width:100%;">
         ${itemsHTML}
       </div>
 
       <div class="separator-dashed"></div>
 
-      <!-- SUMMARY -->
-      <div class="summary-section">
+      <!-- SUMMARY TABLE -->
+      <table class="receipt-row-table" style="font-size:12px;margin:2px 0;">
+        <tr>
+          <td style="width:58%;text-align:left;padding:1.5px 0;">
+            ${t("subtotal")}${isParcelOrder ? " (Incl. GST)" : ""}
+          </td>
+          <td style="width:42%;text-align:right;font-weight:bold;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
+            ₹${Number(order.subtotal || 0).toFixed(2)}
+          </td>
+        </tr>
 
-        <div class="summary-row">
-          <span>${t("subtotal")}</span>
-          <span>
-            Rs.${Number(order.subtotal || 0).toFixed(2)}
-          </span>
-        </div>
+        ${settings?.show_gst !== false
+      ? `
+                <tr>
+                  <td style="width:58%;text-align:left;padding:1.5px 0;">
+                    CGST (${cgstRate}%${isParcelOrder ? " incl." : ""})
+                  </td>
+                  <td style="width:42%;text-align:right;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
+                    ₹${Number(cgstVal).toFixed(2)}
+                  </td>
+                </tr>
 
-        ${
-          settings?.show_gst !== false
-            ? `
-              <div class="summary-row">
-                <span>CGST (${cgstRate}%)</span>
-                <span>
-                  Rs.${Number(cgstVal).toFixed(2)}
-                </span>
-              </div>
+                <tr>
+                  <td style="width:58%;text-align:left;padding:1.5px 0;">
+                    SGST (${sgstRate}%${isParcelOrder ? " incl." : ""})
+                  </td>
+                  <td style="width:42%;text-align:right;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
+                    ₹${Number(sgstVal).toFixed(2)}
+                  </td>
+                </tr>
+              `
+      : ""
+    }
 
-              <div class="summary-row">
-                <span>SGST (${sgstRate}%)</span>
-                <span>
-                  Rs.${Number(sgstVal).toFixed(2)}
-                </span>
-              </div>
+        ${order.discount > 0
+      ? `
+              <tr>
+                <td style="width:58%;text-align:left;padding:1.5px 0;">
+                  ${t("discount")}
+                </td>
+                <td style="width:42%;text-align:right;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
+                  -₹${Number(order.discount).toFixed(2)}
+                </td>
+              </tr>
             `
-            : ""
-        }
-
-        ${
-          order.discount > 0
-            ? `
-              <div class="summary-row discount-row">
-                <span>${t("discount")}</span>
-                <span>
-                  -Rs.${Number(order.discount).toFixed(2)}
-                </span>
-              </div>
-            `
-            : ""
-        }
-
-      </div>
+      : ""
+    }
+      </table>
 
       <div class="separator-dashed"></div>
 
-      <!-- TOTAL -->
-      <div class="summary-row total-row">
-        <span>${t("total_uppercase")}</span>
-        <span>
-          Rs.${Number(order.total || 0).toFixed(2)}
-        </span>
-      </div>
+      <!-- TOTAL TABLE -->
+      <table class="receipt-row-table" style="margin:2px 0;">
+        <tr>
+          <td style="width:45%;text-align:left;font-size:15px;font-weight:800;padding:2px 0;">
+            ${t("total_uppercase")}
+          </td>
+          <td style="width:55%;text-align:right;font-size:15px;font-weight:800;padding:2px 1px 2px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
+            ₹${Number(finalTotal || 0).toFixed(2)}
+          </td>
+        </tr>
+      </table>
 
       <div class="separator-dashed"></div>
 
       <!-- FOOTER -->
-      <div style="
-        text-align:center;
-        font-weight:bold;
-        text-transform:uppercase;
-        margin-top:6px;
-        font-size:11px;
-      ">
+      <div style="text-align:center;font-weight:bold;text-transform:uppercase;margin-top:4px;font-size:11.5px;width:100%;">
         ${safe(
           !settings?.footer_msg ||
           settings.footer_msg === "Thank you! Please visit again." ||
@@ -665,109 +507,22 @@ function buildReceiptBlock({
         )}
       </div>
 
-      <div
-        class="separator-dashed"
-        style="margin-top:8px;"
-      ></div>
+      <div class="separator-dashed" style="margin-top:5px;"></div>
 
-      <div style="
-        text-align:center;
-        font-size:9px;
-        color:#666;
-      ">
+      <div style="text-align:center;font-size:9px;color:#333;width:100%;">
         <div style="font-weight:600;">
           Powered by Career Craftly
         </div>
-
-        <div style="
-          margin-top:2px;
-          font-size:8.5px;
-        ">
+        <div style="margin-top:1px;font-size:8px;">
           Crafting Digital Success, Intelligently
         </div>
       </div>
 
-      <div
-        class="separator-solid"
-        style="margin-top:8px;"
-      ></div>
+      <div class="separator-solid" style="margin-top:5px;"></div>
 
     </div>
   `;
 }
-
-// function buildKitchenReceiptBlock({ order, settings, t, tokenNo, receiptNoFormatted, dateStr, timeStr, safe, menu }) {
-//   const nameUpper = safe((settings?.name || 'ANNDEVTA THALI HOUSE').toUpperCase());
-
-//   const itemsHTML = (order.items || []).map((i) => {
-//     const subItems = getItemSubItems(i, t, menu);
-//     const subline = subItems.map((sel) => `• ${safe(sel)}`);
-
-//     return `
-//       <div style="margin-bottom: 8px;">
-//         <div style="font-weight: bold; font-size: 13px; margin-bottom: 2px;">
-//           ${safe(t(i.name))}
-//         </div>
-//         <div style="font-weight: bold; font-size: 11px; color: #111;">
-//           Qty: ${i.qty}
-//         </div>
-//         ${subline.length > 0 ? `
-//         <div style="font-size: 11px; color: #333; padding-left: 8px; margin-top: 3px; line-height: 1.4;">
-//           ${subline.join('<br/>')}
-//         </div>` : ''}
-//       </div>
-//     `;
-//   }).join('');
-
-//   return `
-//   <div class="kitchen-receipt-container">
-//     <div style="text-align: center;">
-//       <div style="font-weight: bold; font-size: 13px; text-transform: uppercase; margin-bottom: 2px;">${nameUpper}</div>
-//     </div>
-
-//     <div class="separator-solid" style="border-top: 1px solid #000; margin: 6px 0;"></div>
-
-//     <div class="bill-info" style="font-size: 11px;">
-//       ${tokenNo !== undefined && tokenNo !== null ? `
-//       <div class="info-row">
-//         <span>TOKEN NO:</span>
-//         <span style="font-weight: bold; font-size: 13px;">#${tokenNo}</span>
-//       </div>` : ''}
-//       <div class="info-row">
-//         <span>BILL NO:</span>
-//         <span style="font-weight: bold;">${receiptNoFormatted}</span>
-//       </div>
-//       <div class="info-row">
-//         <span>DATE:</span>
-//         <span>${dateStr}</span>
-//       </div>
-//       <div class="info-row">
-//         <span>TIME:</span>
-//         <span>${timeStr}</span>
-//       </div>
-//       ${order.notes ? `
-//       <div class="info-row" style="margin-top: 3px; font-weight: bold; color: #d32f2f;">
-//         <span>NOTES:</span>
-//         <span>${safe(order.notes)}</span>
-//       </div>` : ''}
-//     </div>
-
-//     <div class="separator-dashed" style="margin: 6px 0;"></div>
-//     <div style="text-align: center; font-weight: bold; letter-spacing: 1.5px; font-size: 12px;">KITCHEN ORDER</div>
-//     <div class="separator-dashed" style="margin: 6px 0;"></div>
-
-//     <div style="margin: 8px 0;">
-//       ${itemsHTML}
-//     </div>
-
-//     <div class="separator-solid" style="border-top: 1px solid #000; margin-top: 10px; margin-bottom: 4px;"></div>
-//     <div style="text-align: center; font-weight: bold; font-size: 12px; letter-spacing: 1.5px; text-transform: uppercase;">
-//       KITCHEN COPY
-//     </div>
-//     <div class="separator-solid" style="border-top: 1px solid #000; margin-top: 4px; margin-bottom: 6px;"></div>
-//   </div>
-//   `;
-// }
 
 function buildKitchenReceiptBlock({
   order,
@@ -787,47 +542,31 @@ function buildKitchenReceiptBlock({
   const itemsHTML = (order.items || [])
     .map((i) => {
       const subItems = getItemSubItems(i, t, menu);
-
       const subline = subItems.map(
         (sel) => `• ${safe(sel)}`
       );
 
       return `
-        <div style="margin-bottom:8px;">
-
-          <div style="
-            font-weight:bold;
-            font-size:13px;
-            margin-bottom:2px;
-          ">
-            ${safe(t(i.name))}
-          </div>
-
-          <div style="
-            font-weight:bold;
-            font-size:11px;
-            color:#111;
-          ">
-            Qty: ${i.qty}
-          </div>
-
-          ${
-            subline.length > 0
-              ? `
-                <div style="
-                  font-size:11px;
-                  color:#333;
-                  padding-left:8px;
-                  margin-top:3px;
-                  line-height:1.4;
-                ">
-                  ${subline.join("<br/>")}
-                </div>
+        <table class="receipt-row-table" style="margin-bottom:5px;">
+          <tr>
+            <td style="width:70%;text-align:left;vertical-align:top;font-weight:bold;font-size:13px;padding-right:4px;word-break:break-word;">
+              ${safe(t(i.name))}
+            </td>
+            <td style="width:30%;text-align:right;vertical-align:top;font-weight:bold;font-size:12.5px;padding-right:1px;white-space:nowrap;">
+              Qty: ${i.qty}
+            </td>
+          </tr>
+          ${subline.length > 0
+          ? `
+                <tr>
+                  <td colspan="2" style="text-align:left;font-size:11px;color:#222;padding-left:6px;line-height:1.25;">
+                    ${subline.join("<br/>")}
+                  </td>
+                </tr>
               `
-              : ""
-          }
-
-        </div>
+          : ""
+        }
+        </table>
       `;
     })
     .join("");
@@ -835,110 +574,94 @@ function buildKitchenReceiptBlock({
   return `
     <div class="kitchen-receipt-container">
 
-      <div style="text-align:center;">
-        <div style="
-          font-weight:bold;
-          font-size:12px;
-          letter-spacing:.025em;
-          text-transform:uppercase;
-          margin-bottom:2px;
-        ">
+      <div style="text-align:center;width:100%;">
+        <div style="font-weight:bold;font-size:13px;letter-spacing:0.02em;text-transform:uppercase;margin-bottom:2px;">
           ${nameUpper}
         </div>
       </div>
 
-      <div
-        class="separator-solid"
-        style="margin:6px 0;"
-      ></div>
+      <div class="separator-solid" style="margin:3px 0;"></div>
 
-      <!-- KITCHEN INFO -->
-      <div
-        class="bill-info"
-        style="font-size:11px;"
-      >
-
-        ${
-          tokenNo !== undefined && tokenNo !== null
-            ? `
-              <div class="info-row">
-                <span>TOKEN NO:</span>
-                <span style="
-                  font-weight:bold;
-                  font-size:13px;
-                ">
+      <!-- KITCHEN INFO TABLE -->
+      <table class="receipt-row-table" style="font-size:11.5px;margin:2px 0;">
+        ${tokenNo !== undefined && tokenNo !== null
+      ? `
+              <tr>
+                <td style="width:46%;text-align:left;font-weight:bold;font-size:12.5px;padding:2px 0;">TOKEN NO:</td>
+                <td style="width:54%;text-align:right;font-weight:900;font-size:16px;padding:2px 1px 2px 0;white-space:nowrap;">
                   #${tokenNo}
-                </span>
-              </div>
+                </td>
+              </tr>
             `
-            : ""
-        }
+      : ""
+    }
 
-        <div class="info-row">
-          <span>${dateStr}</span>
-          <span>${timeStr}</span>
-        </div>
+        <tr>
+          <td style="width:46%;text-align:left;padding:1px 0;">BILL NO:</td>
+          <td style="width:54%;text-align:right;font-weight:bold;padding:1px 1px 1px 0;white-space:nowrap;">
+            ${receiptNoFormatted}
+          </td>
+        </tr>
 
-        ${
-          order.notes
-            ? `
-              <div
-                class="info-row"
-                style="
-                  margin-top:3px;
-                  font-weight:bold;
-                  color:#d32f2f;
-                "
-              >
-                <span>NOTES:</span>
-                <span>${safe(order.notes)}</span>
-              </div>
+        <tr>
+          <td style="width:50%;text-align:left;padding:1px 0;">${dateStr}</td>
+          <td style="width:50%;text-align:right;padding:1px 1px 1px 0;white-space:nowrap;">${timeStr}</td>
+        </tr>
+
+        ${order.notes
+      ? `
+              <tr>
+                <td style="width:30%;text-align:left;font-weight:bold;color:#000;padding:2px 0;">NOTES:</td>
+                <td style="width:70%;text-align:right;font-weight:bold;padding:2px 1px 2px 0;word-break:break-word;">
+                  ${safe(order.notes)}
+                </td>
+              </tr>
             `
-            : ""
-        }
+      : ""
+    }
+      </table>
 
+      <div class="separator-dashed" style="margin:4px 0;"></div>
+
+      <div style="text-align:center;font-weight:800;letter-spacing:1px;font-size:12px;width:100%;">
+        KITCHEN / COUPON RECEIPT
       </div>
 
-      <div
-        class="separator-dashed"
-        style="margin:6px 0;"
-      ></div>
-
-      <div style="
-        text-align:center;
-        font-weight:800;
-        letter-spacing:1.5px;
-        font-size:12px;
-      ">
-        KITCHEN COPY
-      </div>
-
-      <div
-        class="separator-dashed"
-        style="margin:6px 0;"
-      ></div>
+      <div class="separator-dashed" style="margin:4px 0;"></div>
 
       <!-- ITEMS -->
-      <div style="margin:8px 0;">
+      <div style="margin:4px 0;width:100%;">
         ${itemsHTML}
       </div>
 
-      <div
-        class="separator-solid"
-        style="
-          margin-top:12px;
-          margin-bottom:4px;
-        "
-      ></div>
+      <div class="separator-solid" style="margin-top:6px;margin-bottom:4px;"></div>
 
     </div>
   `;
 }
 
-export async function printReceipt({ order, settings, menu, menuMode }) 
-{
+export async function printReceipt({ order, settings, menu, menuMode }) {
   if (!order) return;
-  const lang = localStorage.getItem("pos_language") || settings?.language || "en";
+
+  // Defensive fallback / merge settings with offlineStorage to ensure fssai is present
+  let effectiveSettings = settings;
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('pos_offline_settings') : null;
+    if (raw) {
+      const cached = JSON.parse(raw)?.data;
+      if (cached) {
+        effectiveSettings = {
+          ...cached,
+          ...(settings || {}),
+          fssai: (settings && settings.fssai !== undefined && settings.fssai !== null && String(settings.fssai).trim() !== '')
+            ? settings.fssai
+            : (cached.fssai || ''),
+        };
+      }
+    }
+  } catch (_) {}
+
+  const lang = localStorage.getItem("pos_language") || effectiveSettings?.language || "en";
   const t = (key) => {
     const dict = translations[lang] || translations["en"];
     return dict[key] || translations["en"][key] || key;
@@ -957,193 +680,45 @@ export async function printReceipt({ order, settings, menu, menuMode })
   const timeStr = `${pad(hours)}:${minutes} ${ampm}`;
 
   // Formatted receipt number based on prefix and padding settings
-  const prefix = settings?.receipt_prefix || '';
-  const paddingCount = Number(settings?.receipt_padding) || 6;
+  const prefix = effectiveSettings?.receipt_prefix || '';
+  const paddingCount = Number(effectiveSettings?.receipt_padding) || 6;
   const receiptNoFormatted = `${prefix}${String(order.receipt_no ?? '').padStart(paddingCount, '0')}`;
 
-  const is58 = Number(settings?.paper_width) === 58;
+  const is58 = Number(effectiveSettings?.paper_width) === 58;
   const paperWidth = is58 ? "58mm" : "80mm";
-  const receiptWidth = "300px";
+  // Active printable head width (72mm for RetSol RTP-80 80mm roll, 48mm for 58mm roll)
+  const printableWidth = is58 ? "48mm" : "72mm";
 
   const customerReceiptHTML = buildReceiptBlock({
     order,
-    settings,
+    settings: effectiveSettings,
     t,
     tokenNo: order.token_no,
     receiptNoFormatted,
     dateStr,
     timeStr,
     safe,
-    menu
+    menu,
+    menuMode,
   });
 
   const kitchenReceiptHTML = buildKitchenReceiptBlock({
     order,
-    settings,
+    settings: effectiveSettings,
     t,
     tokenNo: order.token_no,
     receiptNoFormatted,
     dateStr,
     timeStr,
     safe,
-    menu
+    menu,
+    menuMode,
   });
 
-  const isParcel = menuMode === "parcel";
-
-// const html = `<!doctype html>
-// <html>
-// <head>
-// <meta charset="utf-8"/><title>Receipt #${receiptNoFormatted}</title>
-// <style>
-//   @page {
-//     size: ${paperWidth} auto;
-//     margin: 0;
-//   }
-//   * {
-//     box-sizing: border-box;
-//   }
-//   body {
-//     font-family: 'JetBrains Mono', 'Courier New', Courier, monospace, sans-serif;
-//     font-size: 12px;
-//     line-height: 1.4;
-//     color: #000;
-//     background-color: #fdfbf7;
-//     margin: 0;
-//     padding: 0;
-//     width: 100%;
-//     -webkit-print-color-adjust: exact;
-//     page-break-inside: avoid;
-//   }
-//   .receipt-container, .kitchen-receipt-container {
-//     width: ${receiptWidth};
-//     max-width: 100%;
-//     margin: 0 auto;
-//     padding: 10px;
-//     box-sizing: border-box;
-//     page-break-inside: avoid;
-//     background: #fdfbf7;
-//     border: 1px solid #e6e4de;
-//   }
-//   @media print {
-//     body {
-//       width: 100%;
-//     }
-//     .receipt-container, .kitchen-receipt-container {
-//       width: 100%;
-//       max-width: 100%;
-//       padding: 5px 10px;
-//     }
-//   }
-//   .separator-solid {
-//     border-top: 1px solid #000;
-//     margin: 8px 0;
-//   }
-//   .separator-dashed {
-//     border-top: 1px dashed #000;
-//     margin: 6px 0;
-//   }
-//   .bill-info {
-//     margin: 4px 0;
-//   }
-//   .info-row {
-//     display: flex;
-//     justify-content: space-between;
-//     align-items: center;
-//     margin: 2px 0;
-//   }
-//   .summary-row {
-//     display: flex;
-//     justify-content: space-between;
-//     align-items: center;
-//     margin: 3px 0;
-//   }
-//   .total-row {
-//     font-size: 14px;
-//     font-weight: bold;
-//     padding: 2px 0;
-//   }
-//   .receipt-cut-separator {
-//   width: 100%;
-//   margin: 14px 0;
-//   padding: 8px 0;
-//   border-top: 2px dashed #000;
-//   border-bottom: 2px dashed #000;
-//   text-align: center;
-//   font-size: 9px;
-//   font-weight: bold;
-//   letter-spacing: 1px;
-// }
-
-// .paper-feed-end {
-//   height: 35px;
-// }
-//   }
-  
-// </style>
-// </head>
-// <body>
-// ${
-//   isParcel
-//     ? `
-//       <!-- PARCEL: KITCHEN COPY -->
-//       ${kitchenReceiptHTML}
-
-//       <!-- CUT / TEAR SEPARATOR -->
-//       <div class="receipt-cut-separator">
-//         <span>✂ CUT HERE</span>
-//       </div>
-
-//       <!-- PARCEL: CUSTOMER COPY -->
-//       ${customerReceiptHTML}
-
-//       <!-- Final paper feed -->
-//       <div class="paper-feed-end"></div>
-//     `
-//     : `
-//       <!-- DINING: CUSTOMER COPY ONLY -->
-//       ${customerReceiptHTML}
-
-//       <!-- Final paper feed -->
-//       <div class="paper-feed-end"></div>
-//     `
-// }
-
-// <script>
-//   window.onload = () => {
-//     window.print();
-//     setTimeout(() => window.close(), 500);
-//   };
-// </script>
-
-// </body></html>`;
-
-//   const isElectron = window.electronAPI && window.electronAPI.printer;
-
-//   if (isElectron) {
-//     const printerName = settings?.default_printer || null;
-//     const paperWidth = Number(settings?.paper_width) || 80;
-
-//     window.electronAPI.printer.print(html, printerName, paperWidth)
-//       .then(success => {
-//         if (!success) {
-//           console.error('Direct print failed');
-//           fallbackBrowserPrint(html);
-//         }
-//       })
-//       .catch(error => {
-//         console.error('Print error:', error);
-//         fallbackBrowserPrint(html);
-//       });
-
-//     return true;
-//   } else {
-//     return fallbackBrowserPrint(html);
-//   }
-// }
+  const isParcel = (order?.order_type === "parcel") || (menuMode === "parcel");
 
   // ---------------------------------------------------------
-  // Build a complete printable HTML document
+  // Build a complete printable HTML document formatted for 72mm active printhead
   // ---------------------------------------------------------
   const buildPrintHTML = (receiptContent, title = "Receipt") => {
     return `<!doctype html>
@@ -1155,83 +730,89 @@ export async function printReceipt({ order, settings, menu, menuMode })
 <style>
   @page {
     size: ${paperWidth} auto;
-    margin: 0;
+    margin: 0mm;
   }
 
   * {
-    box-sizing: border-box;
-  }
-
-  body {
-    font-family: 'JetBrains Mono', 'Courier New', Courier, monospace, sans-serif;
-    font-size: 12px;
-    line-height: 1.4;
-    color: #000;
-    background-color: #fdfbf7;
+    box-sizing: border-box !important;
     margin: 0;
     padding: 0;
+  }
+
+  html, body {
     width: 100%;
+    max-width: ${printableWidth};
+    margin: 0;
+    padding: 0;
+    background: #ffffff;
+    color: #000000;
+    font-family: 'Segoe UI', Arial, -apple-system, BlinkMacSystemFont, 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.35;
     -webkit-print-color-adjust: exact;
-    page-break-inside: avoid;
+    print-color-adjust: exact;
   }
 
   .receipt-container,
   .kitchen-receipt-container {
-    width: ${receiptWidth};
-    max-width: 100%;
-    margin: 0 auto;
-    padding: 10px;
-    box-sizing: border-box;
-    page-break-inside: avoid;
-    background: #fdfbf7;
-    border: 1px solid #e6e4de;
+    width: ${printableWidth};
+    max-width: ${printableWidth};
+    margin: 0;
+    padding: 2mm 1.5mm 4mm 1.5mm;
+    box-sizing: border-box !important;
+    background: #ffffff;
+    color: #000000;
+    word-break: break-word;
+    overflow: hidden;
   }
 
   @media print {
-    body {
-      width: 100%;
+    @page {
+      size: ${paperWidth} auto;
+      margin: 0mm;
+    }
+
+    html, body {
+      width: 100% !important;
+      max-width: ${printableWidth} !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      background: #ffffff !important;
     }
 
     .receipt-container,
     .kitchen-receipt-container {
-      width: 100%;
-      max-width: 100%;
-      padding: 5px 10px;
+      width: 100% !important;
+      max-width: ${printableWidth} !important;
+      margin: 0 !important;
+      padding: 1.5mm 1.5mm 3mm 1.5mm !important;
+      border: none !important;
+      background: #ffffff !important;
+      box-sizing: border-box !important;
+      overflow: hidden !important;
     }
   }
 
+  .receipt-row-table {
+    width: 100% !important;
+    table-layout: fixed !important;
+    border-collapse: collapse !important;
+    border-spacing: 0 !important;
+    box-sizing: border-box !important;
+  }
+
   .separator-solid {
-    border-top: 1px solid #000;
-    margin: 8px 0;
-  }
-
-  .separator-dashed {
-    border-top: 1px dashed #000;
-    margin: 6px 0;
-  }
-
-  .bill-info {
+    width: 100%;
+    border: none;
+    border-top: 1.5px solid #000000;
     margin: 4px 0;
   }
 
-  .info-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin: 2px 0;
-  }
-
-  .summary-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin: 3px 0;
-  }
-
-  .total-row {
-    font-size: 14px;
-    font-weight: bold;
-    padding: 2px 0;
+  .separator-dashed {
+    width: 100%;
+    border: none;
+    border-top: 1.5px dashed #000000;
+    margin: 4px 0;
   }
 
   .paper-feed-end {
@@ -1246,20 +827,9 @@ ${receiptContent}
 
 <div class="paper-feed-end"></div>
 
-<script>
-  window.onload = () => {
-    window.print();
-
-    setTimeout(() => {
-      window.close();
-    }, 500);
-  };
-</script>
-
 </body>
 </html>`;
   };
-
 
   // ---------------------------------------------------------
   // Electron printer helper
@@ -1270,29 +840,39 @@ ${receiptContent}
       window.electronAPI.printer;
 
     if (isElectron) {
+      const localPrinter = typeof localStorage !== "undefined" ? localStorage.getItem("pos_default_printer") : null;
       const printerName =
-        settings?.default_printer || null;
+        (effectiveSettings?.default_printer && effectiveSettings.default_printer !== "system_default")
+          ? effectiveSettings.default_printer
+          : (localPrinter || effectiveSettings?.default_printer || "system_default");
 
       const paperWidthSetting =
-        Number(settings?.paper_width) || 80;
+        Number(effectiveSettings?.paper_width) || 80;
 
       try {
-        const success =
+        const res =
           await window.electronAPI.printer.print(
             html,
             printerName,
             paperWidthSetting
           );
 
-        if (!success) {
-          console.error("Direct print failed");
-          fallbackBrowserPrint(html);
+        if (res && res.success === false) {
+          console.error("Direct print failed:", res.error);
+          toast.error(res.error || "Failed to print receipt");
+          return false;
         }
 
-        return success;
+        const isSuccess = typeof res === 'boolean' ? res : !!res?.success;
+        if (!isSuccess) {
+          toast.error("Failed to print receipt");
+          return false;
+        }
+
+        return true;
       } catch (error) {
         console.error("Print error:", error);
-        fallbackBrowserPrint(html);
+        toast.error("Print error: " + (error?.message || "Unknown error"));
         return false;
       }
     }
@@ -1300,13 +880,8 @@ ${receiptContent}
     return fallbackBrowserPrint(html);
   };
 
-
   // ---------------------------------------------------------
-  // DINING
-  //
-  // Only customer receipt.
-  // One print job.
-  // Printer cuts after it.
+  // DINING: Only customer receipt. One print job.
   // ---------------------------------------------------------
   if (!isParcel) {
     const customerHTML = buildPrintHTML(
@@ -1317,112 +892,81 @@ ${receiptContent}
     return await printOneReceipt(customerHTML);
   }
 
-
   // ---------------------------------------------------------
-  // PARCEL
-  //
-  // Print TWO SEPARATE jobs:
-  //
-  // Job 1 → Kitchen Copy → printer cuts
-  //
-  // Job 2 → Customer Copy → printer cuts
-  //
-  // IMPORTANT:
-  // Do NOT combine these into one HTML document.
+  // PARCEL: Print TWO SEPARATE jobs (Kitchen Coupon + Customer Bill)
   // ---------------------------------------------------------
-// ---------------------------------------------------------
-// PARCEL
-//
-// ONE IPC REQUEST
-//
-// Electron main process handles:
-//
-// 1. Kitchen Copy
-// 2. Wait
-// 3. Customer Copy
-//
-// Both are separate printer jobs.
-// ---------------------------------------------------------
+  const kitchenHTML = buildPrintHTML(
+    kitchenReceiptHTML,
+    "Kitchen Coupon"
+  );
 
-const kitchenHTML = buildPrintHTML(
-  kitchenReceiptHTML,
-  "Kitchen Copy"
-);
+  const customerHTML = buildPrintHTML(
+    customerReceiptHTML,
+    "Customer Bill"
+  );
 
-const customerHTML = buildPrintHTML(
-  customerReceiptHTML,
-  "Customer Receipt"
-);
+  const isElectron =
+    window.electronAPI &&
+    window.electronAPI.printer;
 
+  if (isElectron) {
+    try {
+      const localPrinter = typeof localStorage !== "undefined" ? localStorage.getItem("pos_default_printer") : null;
+      const printerName =
+        (effectiveSettings?.default_printer && effectiveSettings.default_printer !== "system_default")
+          ? effectiveSettings.default_printer
+          : (localPrinter || effectiveSettings?.default_printer || "system_default");
 
-const isElectron =
-  window.electronAPI &&
-  window.electronAPI.printer;
+      const paperWidthSetting =
+        Number(effectiveSettings?.paper_width) || 80;
 
-
-if (isElectron) {
-
-  try {
-
-    const printerName =
-      settings?.default_printer || null;
-
-    const paperWidthSetting =
-      Number(settings?.paper_width) || 80;
-
-
-    console.log(
-      "PARCEL: Sending kitchen + customer to Electron printer"
-    );
-
-
-    const success =
-      await window.electronAPI.printer.printParcel(
-        kitchenHTML,
-        customerHTML,
-        printerName,
-        paperWidthSetting
+      console.log(
+        "PARCEL: Sending kitchen + customer to Electron printer"
       );
 
+      const res =
+        await window.electronAPI.printer.printParcel(
+          kitchenHTML,
+          customerHTML,
+          printerName,
+          paperWidthSetting
+        );
 
-    if (!success) {
+      if (res && res.success === false) {
+        console.error(
+          "Parcel direct print failed:",
+          res.error
+        );
+        toast.error(
+          res.error || "Failed to print parcel receipts"
+        );
+        return false;
+      }
 
+      const isSuccess =
+        typeof res === "boolean" ? res : !!res?.success;
+      if (!isSuccess) {
+        toast.error("Failed to print parcel receipts");
+        return false;
+      }
+
+      return true;
+    } catch (error) {
       console.error(
-        "Parcel printing failed"
+        "Parcel print error:",
+        error
       );
-
+      toast.error("Parcel print error: " + (error?.message || "Unknown error"));
       return false;
     }
-
-
-    console.log(
-      "PARCEL: Both receipts sent successfully"
-    );
-
-
-    return true;
-
-  } catch (error) {
-
-    console.error(
-      "Parcel print error:",
-      error
-    );
-
-    return false;
   }
-}
 
+  // Browser / non-Electron path
+  openPrintPopup(kitchenHTML);
+  await new Promise(resolve => setTimeout(resolve, 2500));
+  openPrintPopup(customerHTML);
 
-// Browser fallback
-// This is only used when Electron is unavailable.
-console.warn(
-  "Electron printer unavailable. Using browser print."
-);
-
-return fallbackBrowserPrint(
-  customerHTML
-);
+  return true;
 }
 
 function fallbackBrowserPrint(html) {
@@ -1452,4 +996,27 @@ function fallbackBrowserPrint(html) {
   }, 60000);
 
   return true;
+}
+
+/**
+ * Opens a new popup window, writes HTML into it, then triggers print.
+ */
+function openPrintPopup(html) {
+  const popup = window.open('', '_blank', 'width=400,height=600,scrollbars=no,menubar=no,toolbar=no');
+  if (!popup) {
+    fallbackBrowserPrint(html);
+    return;
+  }
+  try {
+    const htmlWithScript = html.includes('window.print()')
+      ? html
+      : html.replace('</body>', '<script>window.onload=()=>{window.print();setTimeout(()=>{window.close();},500);};</script></body>');
+    popup.document.open();
+    popup.document.write(htmlWithScript);
+    popup.document.close();
+  } catch (e) {
+    console.error('Popup print error', e);
+    try { popup.close(); } catch (_) {}
+    fallbackBrowserPrint(html);
+  }
 }

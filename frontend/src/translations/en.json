@@ -121,6 +121,7 @@
   "restaurant_name": "Restaurant name",
   "address": "Address",
   "gstin": "GSTIN",
+  "fssai_number": "FSSAI Number",
   "phone": "Phone",
   "receipt_format_styles": "Receipt Format Styles",
   "header_alignment": "Header Alignment",

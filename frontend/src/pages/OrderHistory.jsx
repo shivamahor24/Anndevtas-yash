@@ -12,6 +12,7 @@ import { safeArray } from "../lib/safeArray";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { toast } from "sonner";
 import { syncQueue } from "../lib/syncQueue";
+import { resetToken } from "../lib/tokenManager";
 
 export default function OrderHistory() {
   const { t } = useLanguage();
@@ -75,18 +76,40 @@ export default function OrderHistory() {
     const params = {};
     if (q) params.q = q;
     try {
+      const offlineSettings = offlineStorage.loadSettings() || {};
       const [{ data }, s] = await Promise.all([
         api.get("/orders", { params }),
         api.get("/settings"),
       ]);
-      setOrders(safeArray(data)); setSettings(s.data);
+      setOrders(safeArray(data));
+      const mergedSettings = {
+        ...offlineSettings,
+        ...(s?.data || {}),
+        fssai: (s?.data && s.data.fssai !== undefined && s.data.fssai !== null)
+          ? s.data.fssai
+          : (offlineSettings.fssai || ""),
+      };
+      setSettings(mergedSettings);
+      offlineStorage.saveSettings(mergedSettings);
     } catch (err) {
       console.error("Failed to load orders", err);
       setOrders([]);
+      const cached = offlineStorage.loadSettings();
+      if (cached) setSettings(cached);
     }
   }, [q]);
 
-  useEffect(() => { fetchOrders(); }, [fetchOrders]);
+  useEffect(() => {
+    fetchOrders();
+    const handleSettingsUpdate = () => {
+      const cached = offlineStorage.loadSettings();
+      if (cached) setSettings(cached);
+    };
+    window.addEventListener("settingsUpdated", handleSettingsUpdate);
+    return () => {
+      window.removeEventListener("settingsUpdated", handleSettingsUpdate);
+    };
+  }, [fetchOrders]);
 
   const filteredOrders = React.useMemo(() => {
     if (!Array.isArray(orders)) return [];
@@ -158,6 +181,7 @@ export default function OrderHistory() {
     try {
       await api.delete("/orders/reset");
       setOrders([]);
+      resetToken();
       if (syncQueue && typeof syncQueue.clear === "function") {
         syncQueue.clear();
       }
@@ -169,6 +193,7 @@ export default function OrderHistory() {
       setShowResetConfirm(false);
     }
   };
+
 
   return (
     <div className="h-full bg-[#FFFDF9] rounded-[16px] sm:rounded-[20px] md:rounded-[24px] lg:rounded-[32px] border border-[#F4E6D7] shadow-lg p-3 sm:p-4 md:p-5 lg:p-8 flex flex-col overflow-hidden">

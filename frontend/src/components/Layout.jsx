@@ -60,13 +60,26 @@ export default function Layout() {
   useEffect(() => {
     const fetchSettings = async () => {
       try {
+        const { offlineStorage } = await import("../lib/offlineStorage");
+        const cached = offlineStorage.loadSettings() || {};
         const { data } = await api.get("/settings");
         console.log("Settings loaded:", data);
-        setSettings(data);
-        // Also cache settings for offline use
-        try { const { offlineStorage } = await import("../lib/offlineStorage"); offlineStorage.saveSettings(data); } catch (_) { }
+        const merged = {
+          ...cached,
+          ...(data || {}),
+          fssai: (data && data.fssai !== undefined && data.fssai !== null)
+            ? data.fssai
+            : (cached.fssai || ""),
+        };
+        setSettings(merged);
+        offlineStorage.saveSettings(merged);
       } catch (e) {
         console.error("Failed to load settings:", e);
+        try {
+          const { offlineStorage } = await import("../lib/offlineStorage");
+          const cached = offlineStorage.loadSettings();
+          if (cached) setSettings(cached);
+        } catch (_) {}
       }
     };
 

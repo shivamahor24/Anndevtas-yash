@@ -151,7 +151,6 @@ export default function ReceiptPreview({
   menuMode,
 }) {
   const { t } = useLanguage();
-  const isParcel = menuMode === "parcel";
 
   const order = useMemo(() => {
     if (propOrder) {
@@ -180,6 +179,8 @@ export default function ReceiptPreview({
     }
     return null;
   }, [propOrder, cart, totals, customerName, tokenNo]);
+
+  const isParcel = (order?.order_type === "parcel") || (menuMode === "parcel");
 
   const calculatedTotal = useMemo(() => {
     if (!order || !Array.isArray(order.items)) return 0;
@@ -217,34 +218,62 @@ export default function ReceiptPreview({
 
   // Render receipt header template
   const renderHeader = () => {
+    let alignClass = "text-center";
+    let flexJustify = "justify-center";
+    if (settings?.header_alignment === "left") {
+      alignClass = "text-left";
+      flexJustify = "justify-start";
+    } else if (settings?.header_alignment === "right") {
+      alignClass = "text-right";
+      flexJustify = "justify-end";
+    }
+
+    const renderAddress = (addr) => {
+      if (!addr) return null;
+      const lines = String(addr).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      return (
+        <div className={`text-[11px] text-[#333] ${alignClass} w-full leading-tight my-0.5`}>
+          {lines.map((line, idx) => (
+            <div key={idx}>{line}</div>
+          ))}
+        </div>
+      );
+    };
+
     if (settings?.header_template === "compact") {
       return (
-        <div className="text-center">
+        <div className={alignClass}>
           <div className="font-bold text-sm tracking-wide uppercase mb-0.5">{settings?.name || "ANNDEVTA THALI HOUSE"}</div>
-          {settings?.phone && <div className="text-[11px] text-[#333]">PH: {settings.phone}</div>}
+          {settings?.phone && settings.phone.trim() && <div className="text-[11px] text-[#333] mb-0.5">PH: {settings.phone.trim()}</div>}
+          {settings?.gstin && settings.gstin.trim() && <div className="text-[11px] text-[#333]">GSTIN: {settings.gstin.trim()}</div>}
+          {settings?.fssai && settings.fssai.trim() && <div className="text-[11px] text-[#333]">FSSAI: {settings.fssai.trim()}</div>}
         </div>
       );
     }
 
     if (settings?.header_template === "modern") {
       return (
-        <div className="text-center">
-          <div className="flex justify-center mb-1">
+        <div className={alignClass}>
+          <div className={`flex ${flexJustify} mb-1`}>
             <span className="border border-black px-1.5 py-0.5 font-bold tracking-wider text-[11px] bg-black text-[#fdfbf7] rounded-sm">ΨΦ</span>
           </div>
           <div className="font-bold text-sm tracking-wide uppercase mb-0.5">{settings?.name || "ANNDEVTA THALI HOUSE"}</div>
-          {settings?.address && <div className="text-[11px] text-[#333] whitespace-pre-wrap">{settings.address}</div>}
+          {renderAddress(settings?.address)}
+          {settings?.phone && settings.phone.trim() && <div className="text-[11px] text-[#333] mb-0.5">PH: {settings.phone.trim()}</div>}
+          {settings?.gstin && settings.gstin.trim() && <div className="text-[11px] text-[#333]">GSTIN: {settings.gstin.trim()}</div>}
+          {settings?.fssai && settings.fssai.trim() && <div className="text-[11px] text-[#333]">FSSAI: {settings.fssai.trim()}</div>}
         </div>
       );
     }
 
     // Classic Template (Default)
     return (
-      <div className="text-center">
+      <div className={alignClass}>
         <div className="font-bold text-sm tracking-wide uppercase mb-0.5">{settings?.name || "ANNDEVTA THALI HOUSE"}</div>
-        {settings?.address && <div className="text-[11px] text-[#333] whitespace-pre-wrap mb-0.5">{settings.address}</div>}
-        {settings?.phone && <div className="text-[11px] text-[#333] mb-0.5">PH: {settings.phone}</div>}
-        {settings?.gstin && <div className="text-[11px] text-[#333]">GSTIN: {settings.gstin}</div>}
+        {renderAddress(settings?.address)}
+        {settings?.phone && settings.phone.trim() && <div className="text-[11px] text-[#333] mb-0.5">PH: {settings.phone.trim()}</div>}
+        {settings?.gstin && settings.gstin.trim() && <div className="text-[11px] text-[#333]">GSTIN: {settings.gstin.trim()}</div>}
+        {settings?.fssai && settings.fssai.trim() && <div className="text-[11px] text-[#333]">FSSAI: {settings.fssai.trim()}</div>}
       </div>
     );
   };
@@ -287,7 +316,7 @@ export default function ReceiptPreview({
 
         {/* Title */}
         <div className="my-1.5 border-t border-dashed border-black" />
-        <div className="text-center font-extrabold tracking-widest text-xs">KITCHEN COPY</div>
+        <div className="text-center font-extrabold tracking-widest text-xs bg-black text-white py-0.5 rounded-xs">KITCHEN / COUPON RECEIPT</div>
         <div className="my-1.5 border-t border-dashed border-black" />
 
         {/* Items List (No Prices) */}
@@ -335,8 +364,14 @@ export default function ReceiptPreview({
 
         {/* Bill Info Metadata */}
         <div className="space-y-0.5 text-[11px]">
+          <div className="flex justify-between items-center font-bold pb-1 border-b border-dashed border-black/20">
+            <span>Order Type:</span>
+            <span className={order.order_type === "parcel" || isParcel ? "text-amber-800" : "text-slate-800"}>
+              {(order.order_type === "parcel" || isParcel) ? "PARCEL / TAKEAWAY" : "DINE-IN"}
+            </span>
+          </div>
           {(order.token_no !== undefined && order.token_no !== null) && (
-            <div className="flex justify-between items-center">
+            <div className="flex justify-between items-center pt-0.5">
               <span>Token No:</span>
               <span className="font-bold">#{order.token_no}</span>
             </div>
@@ -350,17 +385,6 @@ export default function ReceiptPreview({
           <span>{timeStr}</span>
           
           </div>
-          {/* {order.cashier_name && (
-            <div className="flex justify-between items-center">
-              <span>{t("cashier")}:</span>
-              <span>
-                {
-                  order.cashier_name === "Owner" ? t("owner") :
-                    order.cashier_name === "Cashier" ? t("cashier") : order.cashier_name
-                }
-              </span>
-            </div>
-          )} */}
           {order.customer_name && (
             <div className="flex justify-between items-center">
               <span>{t("customer")}:</span>
@@ -429,22 +453,44 @@ export default function ReceiptPreview({
         {/* Pricing Summary */}
         <div className="space-y-1 text-[#000]">
           <div className="flex justify-between">
-            <span>{t("subtotal")}</span>
+            <span>{t("subtotal")}{isParcel ? " (Incl. GST)" : ""}</span>
             <span>Rs.{Number(order.subtotal || 0).toFixed(2)}</span>
           </div>
           {settings?.show_gst !== false && (() => {
             const cgstRate = order.cgst_rate ?? settings?.cgst_rate ?? ((settings?.gst_rate ?? 5.0) / 2);
             const sgstRate = order.sgst_rate ?? settings?.sgst_rate ?? ((settings?.gst_rate ?? 5.0) / 2);
-            const cgstVal = order.cgst ?? (Number(order.subtotal || 0) * (cgstRate / 100));
-            const sgstVal = order.sgst ?? (Number(order.subtotal || 0) * (sgstRate / 100));
+            const isParcelOrder = (order.order_type === "parcel" || isParcel);
+
+            let cgstVal = order.cgst;
+            let sgstVal = order.sgst;
+
+            if (cgstVal === undefined || sgstVal === undefined) {
+              const sub = Number(order.subtotal || 0);
+              const totalRate = cgstRate + sgstRate;
+              if (isParcelOrder) {
+                if (totalRate > 0) {
+                  const base = sub / (1 + totalRate / 100);
+                  const taxAmt = sub - base;
+                  cgstVal = taxAmt * (cgstRate / totalRate);
+                  sgstVal = taxAmt * (sgstRate / totalRate);
+                } else {
+                  cgstVal = 0;
+                  sgstVal = 0;
+                }
+              } else {
+                cgstVal = sub * (cgstRate / 100);
+                sgstVal = sub * (sgstRate / 100);
+              }
+            }
+
             return (
               <>
                 <div className="flex justify-between">
-                  <span>CGST ({cgstRate}%)</span>
+                  <span>CGST ({cgstRate}%{isParcelOrder ? " incl." : ""})</span>
                   <span>Rs.{Number(cgstVal).toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span>SGST ({sgstRate}%)</span>
+                  <span>SGST ({sgstRate}%{isParcelOrder ? " incl." : ""})</span>
                   <span>Rs.{Number(sgstVal).toFixed(2)}</span>
                 </div>
               </>

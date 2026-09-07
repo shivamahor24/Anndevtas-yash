@@ -121,6 +121,7 @@
   "restaurant_name": "રેસ્ટોરન્ટનું નામ (Restaurant name)",
   "address": "સરનામું (Address)",
   "gstin": "જી.એસ.ટી.આઈ.એન. (GSTIN)",
+  "fssai_number": "એફ.એસ.એસ.એ.આઈ. નંબર (FSSAI Number)",
   "phone": "ફોન (Phone)",
   "receipt_format_styles": "રસીદ ફોર્મેટ શૈલીઓ (Receipt Styles)",
   "header_alignment": "હેડર સંરેખણ (Header Alignment)",

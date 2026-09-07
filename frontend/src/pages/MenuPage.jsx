@@ -63,6 +63,8 @@ export default function MenuPage() {
       thali_extras: "",
       portion_weight_kg: 0,
       menuType: "both",
+      gst_enabled: false,
+      item_gst_rate: 5,
     });
   };
 
@@ -74,7 +76,13 @@ export default function MenuPage() {
     const catObj = categories.find(c => c.id === item.category_id);
     const isThali = item.is_thali || (catObj?.name?.toLowerCase() === "thali");
     const mType = item.menuType || item.menu_type || (isThali ? "both" : "parcel");
-    setEditing({ ...item, thali_groups: groups, menuType: mType });
+    setEditing({
+      ...item,
+      thali_groups: groups,
+      menuType: mType,
+      gst_enabled: item.gst_enabled ?? false,
+      item_gst_rate: item.item_gst_rate ?? 5,
+    });
   };
 
   const save = async () => {
@@ -104,6 +112,8 @@ export default function MenuPage() {
       portion_weight_kg: Number(editing.portion_weight_kg) || 0,
       menuType: mType,
       menu_type: mType,
+      gst_enabled: editing.gst_enabled ?? false,
+      item_gst_rate: editing.gst_enabled ? (Number(editing.item_gst_rate) || 0) : 0,
     };
 
     // Duplicate Prevention: check if item with same name already exists
@@ -315,6 +325,91 @@ export default function MenuPage() {
                     }
                   }} data-testid="edit-price" />
                 </div>
+                {/* GST Configuration Section */}
+                <div className="col-span-2 border border-[#F4E6D7] bg-[#FFFDF9] rounded-xl p-3 space-y-3">
+                  <label className="text-xs uppercase tracking-wider font-bold text-slate-700 block">GST</label>
+
+                  {/* Without GST / With GST segmented control */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEditing({ ...editing, gst_enabled: false })}
+                      className={`flex-1 py-1.5 px-3 rounded-lg text-sm font-semibold border transition-all ${
+                        !editing.gst_enabled
+                          ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white border-[#FF6B00] shadow-sm"
+                          : "bg-white text-slate-600 border-[#E2D5C3] hover:border-[#FF8A3D]"
+                      }`}
+                    >
+                      Without GST
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditing({ ...editing, gst_enabled: true, item_gst_rate: editing.item_gst_rate || 5 })}
+                      className={`flex-1 py-1.5 px-3 rounded-lg text-sm font-semibold border transition-all ${
+                        editing.gst_enabled
+                          ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white border-[#FF6B00] shadow-sm"
+                          : "bg-white text-slate-600 border-[#E2D5C3] hover:border-[#FF8A3D]"
+                      }`}
+                    >
+                      With GST
+                    </button>
+                  </div>
+
+                  {/* GST % picker — shown only if With GST selected */}
+                  {editing.gst_enabled && (
+                    <div className="space-y-2">
+                      <label className="text-[11px] uppercase tracking-wider text-muted-foreground font-medium">How much GST do you want?</label>
+                      <div className="flex flex-wrap gap-2 items-center">
+                        {[0, 5, 12, 18, 28].map((pct) => (
+                          <button
+                            key={pct}
+                            type="button"
+                            onClick={() => setEditing({ ...editing, item_gst_rate: pct })}
+                            className={`px-3 py-1.5 rounded-full text-xs font-bold border transition-all ${
+                              Number(editing.item_gst_rate) === pct
+                                ? "bg-[#FF6B00] text-white border-[#FF6B00] shadow-sm"
+                                : "bg-white text-slate-600 border-[#E2D5C3] hover:border-[#FF8A3D]"
+                            }`}
+                          >
+                            {pct}%
+                          </button>
+                        ))}
+                        {/* Custom input */}
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="0.5"
+                            placeholder="Custom"
+                            value={[0, 5, 12, 18, 28].includes(Number(editing.item_gst_rate)) ? "" : editing.item_gst_rate}
+                            onChange={(e) => setEditing({ ...editing, item_gst_rate: parseFloat(e.target.value) || 0 })}
+                            className="w-20 border border-[#E2D5C3] rounded-full px-2 py-1 text-xs text-center focus:outline-none focus:border-[#FF6B00] bg-white"
+                          />
+                          <span className="text-xs text-slate-500">%</span>
+                        </div>
+                      </div>
+
+                      {/* Live price breakdown */}
+                      {(() => {
+                        const base = Number(editing.price) || 0;
+                        const rate = Number(editing.item_gst_rate) || 0;
+                        const gstAmt = Math.round(base * rate) / 100;
+                        const final = base + gstAmt;
+                        return (
+                          <div className="flex items-center gap-2 text-[11px] text-slate-600 bg-[#FFF4EB] border border-[#FFD8B5] rounded-lg px-3 py-2 font-mono flex-wrap">
+                            <span>Price ₹{base.toFixed(2)}</span>
+                            <span className="text-[#FF6B00] font-bold">+</span>
+                            <span>GST {rate}% (₹{gstAmt.toFixed(2)})</span>
+                            <span className="text-[#FF6B00] font-bold">=</span>
+                            <span className="font-bold text-slate-800">Final ₹{final.toFixed(2)}</span>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+                </div>
+
                 <div className="col-span-2">
                   <label className="text-xs uppercase tracking-wider text-muted-foreground">Inventory Deduction / Portion Weight (kg)</label>
                   <Input type="number" step="0.001" placeholder="0.250" value={editing.portion_weight_kg || ""} onChange={(e) => {

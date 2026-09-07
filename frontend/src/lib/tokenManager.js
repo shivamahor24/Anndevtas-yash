@@ -32,3 +32,10 @@ export function incrementToken() {
   localStorage.setItem("lastTokenNumber", String(nextToken));
   return nextToken;
 }
+
+export function resetToken() {
+  localStorage.setItem("lastTokenNumber", "0");
+  localStorage.setItem("lastTokenDate", getTodayDateString());
+  window.dispatchEvent(new Event("tokenReset"));
+}
+
