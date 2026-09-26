@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import api from "../lib/api";
 import { offlineStorage } from "../lib/offlineStorage";
+import { safeNumber, safeFixed } from "../lib/utils";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -614,8 +615,8 @@ export default function Settings() {
                     <div>
                       <label className="text-[11px] font-bold uppercase tracking-wider text-slate-600">{t("total_gst") ?? "Total GST"}</label>
                       <div className="mt-1 h-9 px-3 bg-slate-50 border border-[#F4E6D7] rounded-xl text-xs font-extrabold flex items-center justify-between text-slate-900 select-none">
-                        <span className="text-sm font-mono text-[#FF6B00]">{((Number(s.cgst_rate ?? 2.5) || 0) + (Number(s.sgst_rate ?? 2.5) || 0)).toFixed(1)}%</span>
-                        <span className="text-[10px] text-slate-500 font-normal">({s.cgst_rate ?? 2.5}% + {s.sgst_rate ?? 2.5}%)</span>
+                        <span className="text-sm font-mono text-[#FF6B00]">{safeFixed(safeNumber(s?.cgst_rate, 2.5) + safeNumber(s?.sgst_rate, 2.5), 1)}%</span>
+                        <span className="text-[10px] text-slate-500 font-normal">({s?.cgst_rate ?? 2.5}% + {s?.sgst_rate ?? 2.5}%)</span>
                       </div>
                     </div>
                   </div>

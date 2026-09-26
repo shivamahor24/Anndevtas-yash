@@ -1,15 +1,18 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
+import * as XLSX from "xlsx";
 import api from "../lib/api";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Switch } from "../components/ui/switch";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "../components/ui/dialog";
-import { Plus, Trash2, Sparkles, Pencil } from "lucide-react";
+import { Plus, Trash2, Sparkles, Pencil, FileSpreadsheet, Download, Upload, AlertCircle, CheckCircle2, AlertTriangle, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { useLanguage } from "../context/LanguageContext";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { safeArray } from "../lib/safeArray";
+import { offlineStorage } from "../lib/offlineStorage";
+import { safeNumber, safeFixed } from "../lib/utils";
 
 function translateExtras(extrasStr, t) {
   if (!extrasStr) return "";
@@ -34,11 +37,26 @@ export default function MenuPage() {
   const [confirmDialog, setConfirmDialog] = useState({ open: false, action: null, title: "", message: "" });
   const { t } = useLanguage();
 
+  // Excel Import States
+  const fileInputRef = useRef(null);
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [importFile, setImportFile] = useState(null);
+  const [importRows, setImportRows] = useState([]);
+  const [skipDuplicates, setSkipDuplicates] = useState(false);
+  const [menuDestination, setMenuDestination] = useState("dining");
+  const [isImporting, setIsImporting] = useState(false);
+
   const refresh = async () => {
     try {
       const [c, m] = await Promise.all([api.get("/categories"), api.get("/menu")]);
-      setCategories(safeArray(c.data));
-      setMenu(safeArray(m.data));
+      const catList = safeArray(c.data);
+      const menuList = safeArray(m.data);
+      setCategories(catList);
+      setMenu(menuList);
+      try {
+        offlineStorage.saveCategories(catList);
+        offlineStorage.saveMenu(menuList);
+      } catch (_) {}
     } catch (e) {
       console.error("MenuPage load failed:", e);
     }
@@ -49,6 +67,250 @@ export default function MenuPage() {
     if (!catName.trim()) return;
     await api.post("/categories", { name: catName });
     setCatName(""); refresh();
+  };
+
+  // --- Excel Import Handlers ---
+  const handleFileSelected = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Reset input value so same file can be re-selected if user wants
+    e.target.value = "";
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const buffer = evt.target?.result;
+        const wb = XLSX.read(buffer, { type: "array" });
+        const firstSheetName = wb.SheetNames[0];
+        if (!firstSheetName) {
+          toast.error("The selected Excel workbook has no sheets.");
+          return;
+        }
+        const ws = wb.Sheets[firstSheetName];
+        const rawRows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+        if (!rawRows || rawRows.length === 0) {
+          toast.error("The selected Excel file contains no data rows.");
+          return;
+        }
+
+        const seenNamesInFile = new Set();
+        const parsed = rawRows.map((row, idx) => {
+          const rowNum = idx + 2; // Excel row index considering row 1 is header
+          const errors = [];
+
+          // Helper to find column key case-insensitively
+          const getVal = (regex) => {
+            const key = Object.keys(row).find((k) => regex.test(k.trim()));
+            return key ? String(row[key]).trim() : "";
+          };
+
+          const name = getVal(/^(item\s*name|name|item|dish|product)$/i);
+          const category = getVal(/^(category|cat|category\s*name|group)$/i);
+          const priceRaw = getVal(/^(price|rate|amount|cost|mrp)$/i);
+          const description = getVal(/^(description|desc|details|extras)$/i);
+          const taxRaw = getVal(/^(tax\/gst|tax|gst|tax\s*rate|gst\s*rate|tax\s*%|gst\s*%)$/i);
+          const availRaw = getVal(/^(available\/status|available|status|is\s*available|active)$/i);
+
+          // Required validations
+          if (!name) {
+            errors.push("Missing Item Name");
+          }
+          if (!category) {
+            errors.push("Missing Category");
+          }
+
+          const priceNum = Number(priceRaw);
+          if (priceRaw === "" || isNaN(priceNum) || priceNum < 0) {
+            errors.push("Valid Price required");
+          }
+
+          let taxNum = 0;
+          if (taxRaw !== "") {
+            const parsedTax = Number(String(taxRaw).replace("%", "").trim());
+            if (!isNaN(parsedTax) && parsedTax >= 0) {
+              taxNum = parsedTax;
+            }
+          }
+
+          let available = true;
+          if (availRaw !== "") {
+            const lowerAvail = availRaw.toLowerCase();
+            if (["no", "false", "0", "n", "inactive", "unavailable"].includes(lowerAvail)) {
+              available = false;
+            }
+          }
+
+          // Duplicate detection against current menu and previous rows in this file
+          const lowerName = name.toLowerCase();
+          const isDuplicateInDb = Boolean(name && menu.some(
+            (m) => m.name && m.name.trim().toLowerCase() === lowerName
+          ));
+          const isDuplicateInFile = Boolean(name && seenNamesInFile.has(lowerName));
+          if (name) {
+            seenNamesInFile.add(lowerName);
+          }
+
+          const isDuplicate = isDuplicateInDb || isDuplicateInFile;
+          const status = errors.length > 0 ? "error" : (isDuplicate ? "duplicate" : "valid");
+
+          return {
+            rowNumber: rowNum,
+            name,
+            category,
+            price: isNaN(priceNum) ? priceRaw : priceNum,
+            description,
+            taxRate: taxNum,
+            available,
+            isDuplicate,
+            isDuplicateInDb,
+            isDuplicateInFile,
+            errors,
+            status,
+          };
+        });
+
+        setImportRows(parsed);
+        setImportFile(file);
+        setImportModalOpen(true);
+      } catch (err) {
+        console.error("Error reading Excel file:", err);
+        toast.error("Failed to parse Excel file: " + (err.message || "Invalid format"));
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const downloadTemplate = () => {
+    try {
+      const templateData = [
+        {
+          "Item Name": "Paneer Tikka",
+          "Category": "Starter",
+          "Price": 220,
+          "Description": "Grilled paneer with spices",
+          "Tax/GST": 5,
+          "Available": "Yes",
+        },
+        {
+          "Item Name": "Butter Naan",
+          "Category": "Bread",
+          "Price": 60,
+          "Description": "Tandoori butter naan",
+          "Tax/GST": 5,
+          "Available": "Yes",
+        },
+        {
+          "Item Name": "Dal Makhani",
+          "Category": "Main Course",
+          "Price": 180,
+          "Description": "Creamy black lentils",
+          "Tax/GST": 5,
+          "Available": "Yes",
+        },
+        {
+          "Item Name": "Gujarati Thali",
+          "Category": "Thali",
+          "Price": 250,
+          "Description": "Special authentic Gujarati meal",
+          "Tax/GST": 5,
+          "Available": "Yes",
+        },
+      ];
+
+      const ws = XLSX.utils.json_to_sheet(templateData);
+      ws["!cols"] = [
+        { wch: 22 },
+        { wch: 16 },
+        { wch: 10 },
+        { wch: 32 },
+        { wch: 10 },
+        { wch: 12 },
+      ];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Menu Template");
+      XLSX.writeFile(wb, "Menu_Import_Template.xlsx");
+      toast.success("Excel template downloaded successfully");
+    } catch (err) {
+      console.error("Template download error:", err);
+      toast.error("Failed to generate Excel template");
+    }
+  };
+
+  const handleExecuteImport = async () => {
+    // Filter out rows with errors
+    const validRows = importRows.filter((r) => r.status !== "error");
+    const rowsToImport = skipDuplicates
+      ? validRows.filter((r) => !r.isDuplicate)
+      : validRows;
+
+    if (rowsToImport.length === 0) {
+      toast.error("No valid items to import.");
+      return;
+    }
+
+    setIsImporting(true);
+    try {
+      const itemsPayload = rowsToImport.map((r) => ({
+        name: r.name,
+        category: r.category,
+        price: Number(r.price),
+        description: r.description || "",
+        tax_rate: Number(r.taxRate || 0),
+        available: Boolean(r.available),
+      }));
+
+      let resData = null;
+      try {
+        const { data } = await api.post("/menu/bulk-import", {
+          items: itemsPayload,
+          skip_duplicates: skipDuplicates,
+          menu_destination: menuDestination,
+        });
+        resData = data;
+      } catch (backendErr) {
+        console.warn("Backend bulk-import endpoint error, using fallback creation:", backendErr);
+        // Fallback: create categories and items one by one
+        const currentCats = [...categories];
+        for (const r of itemsPayload) {
+          let cat = currentCats.find((c) => c.name.toLowerCase() === r.category.toLowerCase());
+          if (!cat) {
+            const { data: newCat } = await api.post("/categories", { name: r.category });
+            currentCats.push(newCat);
+            cat = newCat;
+          }
+          const isThali = r.category.toLowerCase().includes("thali") || r.name.toLowerCase().includes("thali");
+          await api.post("/menu", {
+            name: r.name,
+            category_id: cat.id,
+            price: r.price,
+            available: r.available,
+            is_thali: isThali,
+            thali_extras: r.description,
+            menuType: menuDestination,
+            menu_type: menuDestination,
+            gst_enabled: r.tax_rate > 0,
+            item_gst_rate: r.tax_rate,
+          });
+        }
+      }
+
+      // Refresh categories and menu so imported items appear immediately in UI
+      await refresh();
+
+      const importedCount = resData?.total_processed || rowsToImport.length;
+      toast.success(`${importedCount} items imported successfully.`);
+      setImportModalOpen(false);
+      setImportRows([]);
+      setImportFile(null);
+      setMenuDestination("dining");
+    } catch (err) {
+      console.error("Import execution failed:", err);
+      toast.error("Failed to import menu items: " + (err.response?.data?.detail || err.message));
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   const startNew = () => {
@@ -170,9 +432,34 @@ export default function MenuPage() {
           <div className="text-[15px] uppercase tracking-[0.1em] font-bold bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] bg-clip-text text-transparent">{t("menu_database")}</div>
           <h1 className="font-display text-3xl font-extrabold tracking-tight text-slate-900">{t("nav_menu")}</h1>
         </div>
-        <Button onClick={startNew} className="bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] hover:brightness-105 text-white" data-testid="add-item-btn">
-          <Plus className="w-3 h-4 mr-2" /> {t("add_item")}
-        </Button>
+        <div className="flex items-center gap-2.5">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx, .xls"
+            className="hidden"
+            onChange={handleFileSelected}
+            data-testid="excel-file-input"
+          />
+          <Button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            variant="outline"
+            className="border-[#F4E6D7] bg-white hover:bg-[#FFF8F2] text-slate-700 hover:text-[#FF6B00] font-bold rounded-xl shadow-xs transition-all flex items-center gap-2 cursor-pointer h-10 px-3.5 text-xs sm:text-sm"
+            data-testid="import-excel-btn"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+            <span>Import Excel</span>
+          </Button>
+
+          <Button
+            onClick={startNew}
+            className="bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] hover:brightness-105 text-white font-bold rounded-xl shadow-xs transition-all flex items-center cursor-pointer h-10 px-4 text-xs sm:text-sm"
+            data-testid="add-item-btn"
+          >
+            <Plus className="w-3 h-4 mr-2" /> {t("add_item")}
+          </Button>
+        </div>
       </div>
 
       <div className="overflow-y-auto flex-1 min-h-0">
@@ -392,17 +679,17 @@ export default function MenuPage() {
 
                       {/* Live price breakdown */}
                       {(() => {
-                        const base = Number(editing.price) || 0;
-                        const rate = Number(editing.item_gst_rate) || 0;
+                        const base = safeNumber(editing.price);
+                        const rate = safeNumber(editing.item_gst_rate);
                         const gstAmt = Math.round(base * rate) / 100;
                         const final = base + gstAmt;
                         return (
                           <div className="flex items-center gap-2 text-[11px] text-slate-600 bg-[#FFF4EB] border border-[#FFD8B5] rounded-lg px-3 py-2 font-mono flex-wrap">
-                            <span>Price ₹{base.toFixed(2)}</span>
+                            <span>Price ₹{safeFixed(base)}</span>
                             <span className="text-[#FF6B00] font-bold">+</span>
-                            <span>GST {rate}% (₹{gstAmt.toFixed(2)})</span>
+                            <span>GST {rate}% (₹{safeFixed(gstAmt)})</span>
                             <span className="text-[#FF6B00] font-bold">=</span>
-                            <span className="font-bold text-slate-800">Final ₹{final.toFixed(2)}</span>
+                            <span className="font-bold text-slate-800">Final ₹{safeFixed(final)}</span>
                           </div>
                         );
                       })()}
@@ -536,6 +823,366 @@ export default function MenuPage() {
           </DialogContent>
         </Dialog>
       )}
+
+      {/* Excel Import Preview Modal */}
+      <Dialog open={importModalOpen} onOpenChange={(open) => {
+        if (!isImporting) {
+          setImportModalOpen(open);
+          if (!open) {
+            setImportRows([]);
+            setImportFile(null);
+            setMenuDestination("dining");
+          }
+        }
+      }}>
+        <DialogContent className="max-w-4xl max-h-[90vh] flex flex-col p-6 rounded-2xl bg-white border border-[#F4E6D7] shadow-xl overflow-hidden">
+          <DialogHeader className="flex flex-row items-center justify-between pb-3 border-b border-[#F4E6D7]">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#FFF1E5] text-[#FF6B00] border border-[#FFD8B5] flex items-center justify-center">
+                <FileSpreadsheet className="w-5 h-5" />
+              </div>
+              <div>
+                <DialogTitle className="font-display text-xl font-bold text-slate-800">
+                  Import Menu from Excel
+                </DialogTitle>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  File: <span className="font-semibold text-slate-700">{importFile?.name || "Spreadsheet"}</span>
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={downloadTemplate}
+                className="text-xs font-semibold text-slate-600 border-[#F4E6D7] hover:bg-[#FFF8F2] hover:text-[#FF6B00] flex items-center gap-1.5 h-8 rounded-lg cursor-pointer"
+                data-testid="download-template-btn"
+              >
+                <Download className="w-3.5 h-3.5 text-[#FF6B00]" />
+                <span>Download Excel Template</span>
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                className="text-xs font-medium text-slate-500 hover:text-slate-800 hover:bg-slate-100 flex items-center gap-1 h-8 rounded-lg cursor-pointer"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>Change File</span>
+              </Button>
+            </div>
+          </DialogHeader>
+
+          {/* Stats Bar */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 py-3">
+            <div className="bg-[#FFFDF9] border border-[#F4E6D7] rounded-xl p-2.5">
+              <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Total Rows</div>
+              <div className="text-xl font-extrabold text-slate-800 mt-0.5">{importRows.length}</div>
+            </div>
+            <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-2.5">
+              <div className="text-[11px] font-bold text-emerald-700 uppercase tracking-wider flex items-center gap-1">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Valid Items</span>
+              </div>
+              <div className="text-xl font-extrabold text-emerald-700 mt-0.5">
+                {importRows.filter(r => r.status === "valid").length}
+              </div>
+            </div>
+            <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-2.5">
+              <div className="text-[11px] font-bold text-amber-700 uppercase tracking-wider flex items-center gap-1">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                <span>Existing / Duplicates</span>
+              </div>
+              <div className="text-xl font-extrabold text-amber-700 mt-0.5">
+                {importRows.filter(r => r.status === "duplicate").length}
+              </div>
+            </div>
+            <div className="bg-rose-50/70 border border-rose-200 rounded-xl p-2.5">
+              <div className="text-[11px] font-bold text-rose-700 uppercase tracking-wider flex items-center gap-1">
+                <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+                <span>Invalid Rows</span>
+              </div>
+              <div className="text-xl font-extrabold text-rose-700 mt-0.5">
+                {importRows.filter(r => r.status === "error").length}
+              </div>
+            </div>
+          </div>
+
+          {/* Options / Notice */}
+          <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={skipDuplicates}
+                onChange={(e) => setSkipDuplicates(e.target.checked)}
+                className="w-4 h-4 rounded text-[#FF6B00] border-slate-300 focus:ring-[#FF6B00] accent-[#FF6B00]"
+              />
+              <span className="text-slate-700 font-medium">
+                Skip existing / duplicate items (don't overwrite)
+              </span>
+            </label>
+            <div className="text-slate-500 italic">
+              * Categories not in your database will be auto-created. Invalid rows are skipped automatically.
+            </div>
+          </div>
+
+          {/* Menu Destination Selector */}
+          <div className="bg-[#FFFDF9] border border-[#F4E6D7] rounded-xl p-3 space-y-2">
+            <div className="text-xs font-bold uppercase tracking-wider text-slate-700">
+              Where should these items be added?
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              {/* Dining Menu Option */}
+              <label
+                onClick={() => setMenuDestination("dining")}
+                className={`relative flex items-start gap-2.5 p-2.5 rounded-xl border transition-all cursor-pointer select-none ${
+                  menuDestination === "dining"
+                    ? "bg-[#FFF8F2] border-[#FF6B00] ring-1 ring-[#FF6B00]/40 shadow-xs"
+                    : "bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50/70"
+                }`}
+                data-testid="dest-dining"
+              >
+                <input
+                  type="radio"
+                  name="menuDestination"
+                  value="dining"
+                  checked={menuDestination === "dining"}
+                  onChange={() => setMenuDestination("dining")}
+                  className="w-4 h-4 mt-0.5 text-[#FF6B00] accent-[#FF6B00] focus:ring-[#FF6B00] cursor-pointer"
+                />
+                <div className="flex-1">
+                  <div className={`text-xs font-bold ${menuDestination === "dining" ? "text-[#FF6B00]" : "text-slate-800"}`}>
+                    Dining Menu
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 leading-snug">
+                    Add all imported items only to the Dining Menu.
+                  </div>
+                </div>
+              </label>
+
+              {/* Parcel Menu Option */}
+              <label
+                onClick={() => setMenuDestination("parcel")}
+                className={`relative flex items-start gap-2.5 p-2.5 rounded-xl border transition-all cursor-pointer select-none ${
+                  menuDestination === "parcel"
+                    ? "bg-[#FFF8F2] border-[#FF6B00] ring-1 ring-[#FF6B00]/40 shadow-xs"
+                    : "bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50/70"
+                }`}
+                data-testid="dest-parcel"
+              >
+                <input
+                  type="radio"
+                  name="menuDestination"
+                  value="parcel"
+                  checked={menuDestination === "parcel"}
+                  onChange={() => setMenuDestination("parcel")}
+                  className="w-4 h-4 mt-0.5 text-[#FF6B00] accent-[#FF6B00] focus:ring-[#FF6B00] cursor-pointer"
+                />
+                <div className="flex-1">
+                  <div className={`text-xs font-bold ${menuDestination === "parcel" ? "text-[#FF6B00]" : "text-slate-800"}`}>
+                    Parcel Menu
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 leading-snug">
+                    Add all imported items only to the Parcel Menu.
+                  </div>
+                </div>
+              </label>
+
+              {/* Both Menus Option */}
+              <label
+                onClick={() => setMenuDestination("both")}
+                className={`relative flex items-start gap-2.5 p-2.5 rounded-xl border transition-all cursor-pointer select-none ${
+                  menuDestination === "both"
+                    ? "bg-[#FFF8F2] border-[#FF6B00] ring-1 ring-[#FF6B00]/40 shadow-xs"
+                    : "bg-white border-slate-200 hover:border-slate-300 hover:bg-slate-50/70"
+                }`}
+                data-testid="dest-both"
+              >
+                <input
+                  type="radio"
+                  name="menuDestination"
+                  value="both"
+                  checked={menuDestination === "both"}
+                  onChange={() => setMenuDestination("both")}
+                  className="w-4 h-4 mt-0.5 text-[#FF6B00] accent-[#FF6B00] focus:ring-[#FF6B00] cursor-pointer"
+                />
+                <div className="flex-1">
+                  <div className={`text-xs font-bold ${menuDestination === "both" ? "text-[#FF6B00]" : "text-slate-800"}`}>
+                    Both Menus
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 leading-snug">
+                    Add all imported items to both the Dining Menu and Parcel Menu.
+                  </div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          {/* Preview Table */}
+          <div className="flex-1 min-h-0 overflow-y-auto border border-[#F4E6D7] rounded-xl my-2">
+            <table className="w-full text-xs text-left">
+              <thead className="sticky top-0 z-10 bg-slate-100 text-slate-600 font-bold uppercase tracking-wider text-[10px] border-b border-[#F4E6D7]">
+                <tr>
+                  <th className="px-3 py-2 w-12 text-center">Row</th>
+                  <th className="px-3 py-2 w-28">Status</th>
+                  <th className="px-3 py-2">Item Name</th>
+                  <th className="px-3 py-2">Category</th>
+                  <th className="px-3 py-2 text-right">Price</th>
+                  <th className="px-3 py-2 text-center">Tax %</th>
+                  <th className="px-3 py-2 text-center">Available</th>
+                  <th className="px-3 py-2">Issues / Notes</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {importRows.map((row) => {
+                  const isExistingCat = categories.some(
+                    c => c.name.toLowerCase() === (row.category || "").toLowerCase()
+                  );
+                  return (
+                    <tr
+                      key={row.rowNumber}
+                      className={
+                        row.status === "error"
+                          ? "bg-rose-50/50 hover:bg-rose-50"
+                          : row.status === "duplicate"
+                          ? "bg-amber-50/40 hover:bg-amber-50/70"
+                          : "hover:bg-slate-50"
+                      }
+                    >
+                      <td className="px-3 py-2 text-center font-mono font-bold text-slate-500">
+                        #{row.rowNumber}
+                      </td>
+                      <td className="px-3 py-2">
+                        {row.status === "error" ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 border border-rose-200">
+                            <AlertCircle className="w-3 h-3" /> Error
+                          </span>
+                        ) : row.status === "duplicate" ? (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                            <AlertTriangle className="w-3 h-3" /> Duplicate
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">
+                            <CheckCircle2 className="w-3 h-3" /> Ready
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 font-medium text-slate-800">
+                        {row.name || <span className="italic text-rose-500 font-normal">Missing name</span>}
+                        {row.description && (
+                          <div className="text-[11px] text-slate-400 truncate max-w-xs">{row.description}</div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-slate-700">
+                        {row.category ? (
+                          <span className="inline-flex items-center gap-1.5">
+                            <span>{row.category}</span>
+                            {!isExistingCat && (
+                              <span className="text-[9px] font-bold uppercase tracking-wider bg-orange-100 text-[#FF6B00] border border-orange-200 px-1 py-0.2 rounded">
+                                New Cat
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <span className="italic text-rose-500 font-normal">Missing category</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right font-mono font-semibold text-slate-800">
+                        {typeof row.price === "number" ? `₹${row.price}` : <span className="text-rose-500">{row.price || "—"}</span>}
+                      </td>
+                      <td className="px-3 py-2 text-center text-slate-600 font-mono">
+                        {row.taxRate ? `${row.taxRate}%` : "0%"}
+                      </td>
+                      <td className="px-3 py-2 text-center">
+                        <span className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded ${row.available ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
+                          {row.available ? "Yes" : "No"}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        {row.errors?.length > 0 ? (
+                          <span className="text-rose-600 font-medium">{row.errors.join(", ")}</span>
+                        ) : row.status === "duplicate" ? (
+                          <span className="text-amber-700">
+                            {row.isDuplicateInDb ? "Item exists in menu" : "Duplicate name in Excel file"}
+                          </span>
+                        ) : (
+                          <span className="text-emerald-600">Valid</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <DialogFooter className="flex items-center justify-between pt-3 border-t border-[#F4E6D7] mt-2">
+            <div className="text-xs text-slate-500 space-y-0.5">
+              {(() => {
+                const validRows = importRows.filter(r => r.status !== "error");
+                const count = skipDuplicates ? validRows.filter(r => !r.isDuplicate).length : validRows.length;
+                const destText =
+                  menuDestination === "both"
+                    ? "Dining Menu + Parcel Menu"
+                    : menuDestination === "parcel"
+                    ? "Parcel Menu"
+                    : "Dining Menu";
+                return (
+                  <>
+                    <div>
+                      Ready to import: <strong className="text-slate-800">{count}</strong> valid items
+                    </div>
+                    <div>
+                      Destination: <strong className="text-[#FF6B00] font-semibold">{destText}</strong>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setImportModalOpen(false)}
+                disabled={isImporting}
+                className="border-border text-slate-600 cursor-pointer"
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={handleExecuteImport}
+                disabled={
+                  isImporting ||
+                  importRows.filter(r => r.status !== "error" && (!skipDuplicates || !r.isDuplicate)).length === 0
+                }
+                className="bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] hover:brightness-105 text-white font-bold cursor-pointer min-w-[200px]"
+                data-testid="confirm-import-btn"
+              >
+                {isImporting ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                    Importing...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="w-4 h-4 mr-2" />
+                    {menuDestination === "both"
+                      ? "Import to Both Menus"
+                      : menuDestination === "parcel"
+                      ? "Import to Parcel Menu"
+                      : "Import to Dining Menu"}
+                  </>
+                )}
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Custom Confirmation Dialog */}
       <ConfirmDialog

@@ -1,9 +1,26 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import api from "../lib/api";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
-import { Printer, Eye, Search, Trash2, RotateCcw } from "lucide-react";
+import {
+  Printer,
+  Eye,
+  Search,
+  Trash2,
+  RotateCcw,
+  Repeat,
+  RefreshCw,
+  AlertCircle,
+  Clock,
+  UtensilsCrossed,
+  Package,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight
+} from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
 import { printReceipt } from "../lib/receipt";
 import ReceiptPreview from "../components/ReceiptPreview";
@@ -13,14 +30,38 @@ import ConfirmDialog from "../components/ConfirmDialog";
 import { toast } from "sonner";
 import { syncQueue } from "../lib/syncQueue";
 import { resetToken } from "../lib/tokenManager";
+import { offlineStorage, getOrders, updateOrder, deleteOrder, resetOrders } from "../lib/offlineStorage";
+import { safeNumber, safeFixed } from "../lib/utils";
 
 export default function OrderHistory() {
   const { t } = useLanguage();
-  const [orders, setOrders] = useState([]);
-  const [settings, setSettings] = useState(null);
+  const navigate = useNavigate();
+  // Synchronous initialization from offlineStorage for instant (0ms) zero-latency rendering
+  const [orders, setOrders] = useState(() => {
+    try {
+      return offlineStorage.getOrders();
+    } catch (e) {
+      console.error("Initial orders load failed:", e);
+      return [];
+    }
+  });
+  const [settings, setSettings] = useState(() => {
+    try {
+      return offlineStorage.loadSettings() || null;
+    } catch {
+      return null;
+    }
+  });
   const [activeFilter, setActiveFilter] = useState("all");
   const [deleteTarget, setDeleteTarget] = useState(null);
+  const [refundTarget, setRefundTarget] = useState(null);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Pagination state: default query per page is 25
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
 
   const getLocalDateString = (rawDate) => {
     if (!rawDate) return "";
@@ -59,6 +100,11 @@ export default function OrderHistory() {
   const [appliedSearchDate, setAppliedSearchDate] = useState("");
   const [view, setView] = useState(null);
 
+  // Reset pagination to page 1 whenever any filter or search changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [q, activeFilter, appliedSearchDate, from, to]);
+
   const handleFilterChange = (filterKey) => {
     setActiveFilter(filterKey);
     const { fromStr, toStr } = getFilterDateRange(filterKey);
@@ -66,47 +112,63 @@ export default function OrderHistory() {
     setTo(toStr);
     setSearchDate("");
     setAppliedSearchDate("");
+    setCurrentPage(1);
   };
 
   const handleSearchDate = () => {
     setAppliedSearchDate(searchDate);
+    setCurrentPage(1);
   };
 
-  const fetchOrders = useCallback(async () => {
-    const params = {};
-    if (q) params.q = q;
+  const fetchOrders = useCallback(() => {
+    setError(null);
     try {
-      const offlineSettings = offlineStorage.loadSettings() || {};
-      const [{ data }, s] = await Promise.all([
-        api.get("/orders", { params }),
-        api.get("/settings"),
-      ]);
-      setOrders(safeArray(data));
-      const mergedSettings = {
-        ...offlineSettings,
-        ...(s?.data || {}),
-        fssai: (s?.data && s.data.fssai !== undefined && s.data.fssai !== null)
-          ? s.data.fssai
-          : (offlineSettings.fssai || ""),
-      };
-      setSettings(mergedSettings);
-      offlineStorage.saveSettings(mergedSettings);
+      const localOrders = offlineStorage.getOrders();
+      setOrders(localOrders);
+      setLoading(false);
     } catch (err) {
-      console.error("Failed to load orders", err);
-      setOrders([]);
-      const cached = offlineStorage.loadSettings();
-      if (cached) setSettings(cached);
+      console.error("Failed to load order history from storage:", err);
+      setError(err.message || "Unable to load order history");
+      setLoading(false);
     }
-  }, [q]);
+  }, []);
 
   useEffect(() => {
+    // 1. Immediately ensure freshest data on mount
     fetchOrders();
+    const cachedSettings = offlineStorage.loadSettings();
+    if (cachedSettings) setSettings(cachedSettings);
+
+    // 2. Real-time reactive synchronization (captures order placed from Billing or another tab)
+    const handleOrdersChange = () => {
+      try {
+        const fresh = offlineStorage.getOrders();
+        setOrders(fresh);
+      } catch (e) {
+        console.error("Failed to refresh orders from storage:", e);
+      }
+    };
+
+    const handleStorageEvent = (e) => {
+      if (!e || e.key === "pos_offline_orders") {
+        handleOrdersChange();
+      }
+    };
+
     const handleSettingsUpdate = () => {
       const cached = offlineStorage.loadSettings();
       if (cached) setSettings(cached);
     };
+
+    window.addEventListener("ordersUpdated", handleOrdersChange);
+    window.addEventListener("pos_orders_changed", handleOrdersChange);
+    window.addEventListener("storage", handleStorageEvent);
     window.addEventListener("settingsUpdated", handleSettingsUpdate);
+
     return () => {
+      window.removeEventListener("ordersUpdated", handleOrdersChange);
+      window.removeEventListener("pos_orders_changed", handleOrdersChange);
+      window.removeEventListener("storage", handleStorageEvent);
       window.removeEventListener("settingsUpdated", handleSettingsUpdate);
     };
   }, [fetchOrders]);
@@ -115,10 +177,21 @@ export default function OrderHistory() {
     if (!Array.isArray(orders)) return [];
     let list = orders;
 
+    // Search query filter (Order number, customer name, etc.)
+    if (q) {
+      const query = q.trim().toLowerCase();
+      list = list.filter((o) => {
+        const oNum = String(o.billNumber || o.orderNumber || o.receipt_no || "");
+        const cName = String(o.customerName || o.customer_name || "").toLowerCase();
+        const cPhone = String(o.customerPhone || o.customer_phone || "");
+        return oNum.includes(query) || cName.includes(query) || cPhone.includes(query);
+      });
+    }
+
     // Filter by exact single Search Order Date if applied
     if (appliedSearchDate) {
       list = list.filter((o) => {
-        const rawDate = o.paid_at || o.created_at || o.date;
+        const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
         return getLocalDateString(rawDate) === appliedSearchDate;
       });
     }
@@ -126,7 +199,7 @@ export default function OrderHistory() {
     // Filter by custom From / To date pickers if selected
     if (from || to) {
       list = list.filter((o) => {
-        const rawDate = o.paid_at || o.created_at || o.date;
+        const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
         if (!rawDate) return false;
         const dStr = getLocalDateString(rawDate);
         if (from && dStr < from) return false;
@@ -140,7 +213,7 @@ export default function OrderHistory() {
     const todayStr = getLocalDateString(new Date());
 
     return list.filter((o) => {
-      const rawDate = o.paid_at || o.created_at || o.date;
+      const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
       if (!rawDate) return false;
       const dStr = getLocalDateString(rawDate);
 
@@ -159,19 +232,62 @@ export default function OrderHistory() {
       }
       return true;
     });
-  }, [orders, activeFilter, appliedSearchDate, from, to]);
+  }, [orders, q, activeFilter, appliedSearchDate, from, to]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredOrders.length / pageSize));
+  const safeCurrentPage = Math.min(Math.max(1, currentPage), totalPages);
+
+  const paginatedOrders = React.useMemo(() => {
+    const startIndex = (safeCurrentPage - 1) * pageSize;
+    return filteredOrders.slice(startIndex, startIndex + pageSize);
+  }, [filteredOrders, safeCurrentPage, pageSize]);
 
   const reprint = (o) => printReceipt({ order: o, settings });
+
+  const handleRefundOrder = () => {
+    if (!refundTarget) return;
+    try {
+      offlineStorage.updateOrder(refundTarget.id, {
+        paymentStatus: "Refunded",
+        orderStatus: "Refunded",
+      });
+      setOrders(offlineStorage.getOrders());
+      toast.success(`Bill #${refundTarget.billNumber || refundTarget.orderNumber || refundTarget.receipt_no} marked as Refunded`);
+    } catch (err) {
+      console.error("Failed to refund order", err);
+      toast.error("Failed to process refund");
+    } finally {
+      setRefundTarget(null);
+    }
+  };
+
+  const handleReorder = (order) => {
+    if (!order || !Array.isArray(order.items) || order.items.length === 0) {
+      toast.error("No items found to reorder");
+      return;
+    }
+    try {
+      offlineStorage.saveCart(order.items);
+      toast.success(`Items from Order #${order.billNumber || order.orderNumber || order.receipt_no} added to cart`);
+      navigate("/");
+    } catch (err) {
+      console.error("Failed to reorder:", err);
+      toast.error("Failed to reorder items");
+    }
+  };
 
   const handleDeleteOrder = async () => {
     if (!deleteTarget || !deleteTarget.id) return;
     try {
-      await api.delete(`/orders/${deleteTarget.id}`);
-      setOrders((prev) => prev.filter((o) => o.id !== deleteTarget.id));
+      offlineStorage.deleteOrder(deleteTarget.id);
+      try {
+        await api.delete(`/orders/${deleteTarget.id}`);
+      } catch (_) {}
+      setOrders(offlineStorage.getOrders());
       toast.success(t("order_deleted_success") || "Order deleted successfully");
     } catch (err) {
       console.error("Failed to delete order", err);
-      toast.error(err.response?.data?.detail || "Failed to delete order");
+      toast.error("Failed to delete order");
     } finally {
       setDeleteTarget(null);
     }
@@ -179,7 +295,10 @@ export default function OrderHistory() {
 
   const handleResetOrders = async () => {
     try {
-      await api.delete("/orders/reset");
+      offlineStorage.resetOrders();
+      try {
+        await api.delete("/orders/reset");
+      } catch (_) {}
       setOrders([]);
       resetToken();
       if (syncQueue && typeof syncQueue.clear === "function") {
@@ -188,83 +307,69 @@ export default function OrderHistory() {
       toast.success(t("orders_reset_success") || "All order records deleted successfully");
     } catch (err) {
       console.error("Failed to reset orders", err);
-      toast.error(err.response?.data?.detail || "Failed to delete order records");
+      toast.error("Failed to delete order records");
     } finally {
       setShowResetConfirm(false);
     }
   };
-
 
   return (
     <div className="h-full bg-[#FFFDF9] rounded-[16px] sm:rounded-[20px] md:rounded-[24px] lg:rounded-[32px] border border-[#F4E6D7] shadow-lg p-3 sm:p-4 md:p-5 lg:p-8 flex flex-col overflow-hidden">
       <div className="mb-3 md:mb-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 md:gap-4 shrink-0">
         <div>
           <div className="text-[11px] sm:text-[12px] md:text-[13px] lg:text-[15px] uppercase tracking-[0.1em] font-bold bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] bg-clip-text text-transparent">History</div>
-          <h1 className="font-display text-lg sm:text-xl md:text-2xl lg:text-3xl font-extrabold tracking-tight mt-0.5">{t("order_history")}</h1>
+          <h1 className="font-display text-lg sm:text-xl md:text-2xl lg:text-3xl font-extrabold tracking-tight mt-0.5">{t("order_history") || "Order History"}</h1>
         </div>
 
-        <div className="flex items-center gap-2.5 flex-wrap sm:flex-nowrap">
-          <div className="flex items-center gap-1.5 p-1 bg-[#FFF8F2] border border-[#F4E6D7] rounded-full self-start sm:self-auto max-w-full overflow-x-auto" data-testid="date-filter-buttons">
-            <button
-              type="button"
-              onClick={() => handleFilterChange("all")}
-              data-testid="filter-btn-all"
-              className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap ${
-                activeFilter === "all"
-                  ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
-                  : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
-              }`}
-            >
-              ALL
-            </button>
-            <button
-              type="button"
-              onClick={() => handleFilterChange("today")}
-              data-testid="filter-btn-today"
-              className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap ${
-                activeFilter === "today"
-                  ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
-                  : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
-              }`}
-            >
-              TODAY
-            </button>
-            <button
-              type="button"
-              onClick={() => handleFilterChange("week")}
-              data-testid="filter-btn-week"
-              className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap ${
-                activeFilter === "week"
-                  ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
-                  : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
-              }`}
-            >
-              THIS WEEK
-            </button>
-            <button
-              type="button"
-              onClick={() => handleFilterChange("month")}
-              data-testid="filter-btn-month"
-              className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap ${
-                activeFilter === "month"
-                  ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
-                  : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
-              }`}
-            >
-              THIS MONTH
-            </button>
-          </div>
-
-          <Button
+        <div className="flex items-center gap-1.5 p-1 bg-[#FFF8F2] border border-[#F4E6D7] rounded-full self-start sm:self-auto max-w-full overflow-x-auto" data-testid="date-filter-buttons">
+          <button
             type="button"
-            onClick={() => setShowResetConfirm(true)}
-            data-testid="reset-history-btn"
-            variant="outline"
-            className="group relative overflow-hidden border border-red-200/90 bg-gradient-to-r from-red-500/10 via-rose-500/10 to-red-600/10 hover:from-red-600 hover:to-rose-600 text-red-600 hover:text-white font-bold text-[10px] sm:text-[11px] md:text-xs h-7 sm:h-8 md:h-9 px-3 sm:px-4 rounded-full flex items-center gap-1.5 shrink-0 shadow-xs hover:shadow-md hover:shadow-red-500/25 transition-all duration-300 active:scale-95"
+            onClick={() => handleFilterChange("all")}
+            data-testid="filter-btn-all"
+            className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap cursor-pointer ${
+              activeFilter === "all"
+                ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
+                : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
+            }`}
           >
-            <RotateCcw className="w-3.5 h-3.5 md:w-4 md:h-4 transition-transform duration-500 group-hover:-rotate-180" />
-            <span>Reset</span>
-          </Button>
+            ALL
+          </button>
+          <button
+            type="button"
+            onClick={() => handleFilterChange("today")}
+            data-testid="filter-btn-today"
+            className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap cursor-pointer ${
+              activeFilter === "today"
+                ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
+                : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
+            }`}
+          >
+            TODAY
+          </button>
+          <button
+            type="button"
+            onClick={() => handleFilterChange("week")}
+            data-testid="filter-btn-week"
+            className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap cursor-pointer ${
+              activeFilter === "week"
+                ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
+                : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
+            }`}
+          >
+            THIS WEEK
+          </button>
+          <button
+            type="button"
+            onClick={() => handleFilterChange("month")}
+            data-testid="filter-btn-month"
+            className={`px-2.5 sm:px-3 md:px-3.5 py-1 md:py-1.5 text-[10px] sm:text-[11px] md:text-xs font-bold tracking-wider rounded-full transition-all duration-200 whitespace-nowrap cursor-pointer ${
+              activeFilter === "month"
+                ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
+                : "bg-white text-slate-600 hover:text-slate-900 border border-[#F4E6D7]"
+            }`}
+          >
+            THIS MONTH
+          </button>
         </div>
       </div>
 
@@ -275,21 +380,21 @@ export default function OrderHistory() {
             <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="w-full text-[11px] md:text-xs h-8 md:h-9" data-testid="filter-from" />
           </div>
           <div className="min-w-0">
-            <label className="text-[10px] md:text-xs uppercase tracking-wider font-semibold block mb-0.5 md:mb-1">{t("to")}</label>
+            <label className="text-[10px] md:text-xs uppercase tracking-wider font-semibold block mb-0.5 md:mb-1">{t("to") || "To"}</label>
             <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="w-full text-[11px] md:text-xs h-8 md:h-9" data-testid="filter-to" />
           </div>
           <div className="min-w-0">
-            <label className="text-[10px] md:text-xs uppercase tracking-wider font-semibold block mb-0.5 md:mb-1 truncate">{t("search_receipt_placeholder")}</label>
+            <label className="text-[10px] md:text-xs uppercase tracking-wider font-semibold block mb-0.5 md:mb-1 truncate">Search Bill Number</label>
             <div className="flex gap-1.5">
-              <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. 42" className="min-w-0 flex-1 text-[11px] md:text-xs h-8 md:h-9" data-testid="filter-q" />
-              <Button onClick={fetchOrders} variant="outline" className="border-border shrink-0 px-2.5 md:px-3 h-8 md:h-9" data-testid="filter-go"><Search className="w-3.5 h-3.5 md:w-4 md:h-4" /></Button>
+              <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. 5" className="min-w-0 flex-1 text-[11px] md:text-xs h-8 md:h-9" data-testid="filter-q" />
+              <Button onClick={fetchOrders} variant="outline" className="border-border shrink-0 px-2.5 md:px-3 h-8 md:h-9 cursor-pointer" data-testid="filter-go"><Search className="w-3.5 h-3.5 md:w-4 md:h-4" /></Button>
             </div>
           </div>
           <div className="min-w-0">
             <label className="text-[10px] md:text-xs uppercase tracking-wider font-semibold block mb-0.5 md:mb-1 truncate">Search Order Date</label>
             <div className="flex gap-1.5">
               <Input type="date" value={searchDate} onChange={(e) => setSearchDate(e.target.value)} className="min-w-0 flex-1 text-[11px] md:text-xs h-8 md:h-9" data-testid="filter-search-date" />
-              <Button onClick={handleSearchDate} variant="outline" className="border-border shrink-0 px-2.5 md:px-3 h-8 md:h-9" data-testid="filter-date-go"><Search className="w-3.5 h-3.5 md:w-4 md:h-4" /></Button>
+              <Button onClick={handleSearchDate} variant="outline" className="border-border shrink-0 px-2.5 md:px-3 h-8 md:h-9 cursor-pointer" data-testid="filter-date-go"><Search className="w-3.5 h-3.5 md:w-4 md:h-4" /></Button>
             </div>
           </div>
         </div>
@@ -297,63 +402,354 @@ export default function OrderHistory() {
 
       <Card className="flex-1 border-[#F4E6D7] bg-white rounded-[16px] md:rounded-[22px] lg:rounded-[26px] shadow-sm overflow-hidden flex flex-col min-h-0">
         <div className="flex-1 overflow-auto min-h-0 w-full">
-          <table className="w-full text-[11px] sm:text-xs md:text-[13px] lg:text-sm text-left min-w-[480px] sm:min-w-[540px] md:min-w-[580px]">
-            <thead className="sticky top-0 z-10 bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white text-[10px] md:text-[11.5px] lg:text-[13px] uppercase tracking-[0.15em] font-semibold">
+          <table className="w-full text-[11px] sm:text-xs md:text-[13px] lg:text-sm text-left min-w-[700px]">
+            <thead className="sticky top-0 z-10 bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white text-[10px] md:text-[11.5px] lg:text-[12.5px] uppercase tracking-[0.12em] font-semibold">
               <tr>
-                <th className="text-left px-2.5 md:px-3.5 py-2 md:py-2.5">{t("receipt_no_col")}</th>
-                <th className="text-left px-2.5 md:px-3.5 py-2 md:py-2.5">{t("date")} / {t("time")}</th>
-                <th className="text-left px-2.5 md:px-3.5 py-2 md:py-2.5">{t("items_col")}</th>
-                <th className="text-left px-2.5 md:px-3.5 py-2 md:py-2.5">{t("payment_col")}</th>
-                <th className="text-right px-2.5 md:px-3.5 py-2 md:py-2.5">{t("total")}</th>
-                <th className="px-2.5 md:px-3.5 py-2 md:py-2.5"></th>
+                <th className="text-left px-3 py-2.5">BILL NUMBER</th>
+                <th className="text-left px-3 py-2.5">{t("date") || "Date & Time"}</th>
+                <th className="text-left px-3 py-2.5">Order Type / Table</th>
+                <th className="text-left px-3 py-2.5">{t("items_col") || "Items"}</th>
+                <th className="text-left px-3 py-2.5">{t("payment_col") || "Payment"}</th>
+                <th className="text-left px-3 py-2.5">Order Status</th>
+                <th className="text-right px-3 py-2.5">{t("total") || "Total"}</th>
+                <th className="px-3 py-2.5 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[#F4E6D7]" data-testid="orders-table">
-              {Array.isArray(filteredOrders) && filteredOrders.map(o => {
-                let pm = o.payment_mode;
-                if (o.payment_mode === "cash") pm = t("cash");
-                if (o.payment_mode === "upi") pm = t("upi");
-                if (o.payment_mode === "card") pm = t("card");
-                const orderItems = Array.isArray(o.items) ? o.items : [];
-                return (
-                  <tr key={o.id} className="hover:bg-[#FFF8F2] transition-colors" data-testid={`order-row-${o.id}`}>
-                    <td className="px-2.5 md:px-3.5 py-2 md:py-2.5 font-mono font-semibold text-xs md:text-[13px]">#{o.receipt_no}</td>
-                    <td className="px-2.5 md:px-3.5 py-2 md:py-2.5 text-muted-foreground text-[10px] md:text-xs whitespace-nowrap">{new Date(o.paid_at).toLocaleString('en-IN')}</td>
-                    <td className="px-2.5 md:px-3.5 py-2 md:py-2.5 text-[11px] md:text-xs max-w-[160px] md:max-w-[220px] truncate" title={orderItems.map(i => `${t(i.name)} ×${i.qty}`).join(", ")}>{orderItems.map(i => `${t(i.name)} ×${i.qty}`).join(", ")}</td>
-                    <td className="px-2.5 md:px-3.5 py-2 md:py-2.5 whitespace-nowrap"><span className="text-[9px] md:text-[10px] uppercase tracking-wider font-mono px-1.5 md:px-2 py-0.5 rounded-md bg-sand-subtle border border-border">{pm}</span></td>
-                    <td className="px-2.5 md:px-3.5 py-2 md:py-2.5 text-right font-mono font-bold text-xs md:text-sm whitespace-nowrap">₹{o.total}</td>
-                    <td className="px-2.5 md:px-3.5 py-2 md:py-2.5 text-right whitespace-nowrap">
-                      <div className="flex justify-end items-center gap-0.5">
-                        <button onClick={() => setView(o)} className="p-1 md:p-1.5 hover:bg-sand-subtle rounded-md text-slate-600" data-testid={`view-${o.id}`} title="View Details"><Eye className="w-3.5 h-3.5 md:w-4 md:h-4" /></button>
-                        <button onClick={() => reprint(o)} className="p-1 md:p-1.5 hover:bg-sand-subtle rounded-md text-terracota" data-testid={`reprint-${o.id}`} title="Reprint Receipt"><Printer className="w-3.5 h-3.5 md:w-4 md:h-4" /></button>
-                        <button onClick={() => setDeleteTarget(o)} className="p-1 md:p-1.5 hover:bg-red-50 rounded-md text-red-500 hover:text-red-700 transition-colors" data-testid={`delete-${o.id}`} title="Delete Order"><Trash2 className="w-3.5 h-3.5 md:w-4 md:h-4" /></button>
+              {/* Error State: Explicitly handle storage/database failure */}
+              {error ? (
+                <tr>
+                  <td colSpan="8" className="py-12 text-center">
+                    <div className="flex flex-col items-center justify-center gap-3">
+                      <div className="w-12 h-12 rounded-full bg-red-50 text-red-500 flex items-center justify-center border border-red-100">
+                        <AlertCircle className="w-6 h-6" />
                       </div>
-                    </td>
-                  </tr>
-                );
-              })}
-              {filteredOrders.length === 0 && <tr><td colSpan="6" className="text-center text-muted-foreground py-10 text-xs md:text-sm">{t("no_bills_yet")}</td></tr>}
+                      <div>
+                        <div className="text-base font-bold text-red-600">
+                          Unable to load order history
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1 max-w-sm">
+                          {error}
+                        </p>
+                      </div>
+                      <Button
+                        onClick={fetchOrders}
+                        data-testid="retry-orders-btn"
+                        className="bg-[#FF6B00] hover:bg-[#E05D00] text-white text-xs font-bold px-4 py-2 rounded-xl flex items-center gap-1.5 shadow-md shadow-orange-500/20 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        Retry
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              ) : filteredOrders.length === 0 ? (
+                <tr>
+                  <td colSpan="8" className="text-center text-muted-foreground py-12 text-xs md:text-sm">
+                    {loading ? "Loading orders..." : (t("no_bills_yet") || "No bills yet")}
+                  </td>
+                </tr>
+              ) : (
+                paginatedOrders.map((o) => {
+                  const orderNum = o.billNumber || o.orderNumber || o.receipt_no;
+                  const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
+                  const dateDisplay = rawDate
+                    ? new Date(rawDate).toLocaleString("en-IN", {
+                        day: "2-digit",
+                        month: "short",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        hour12: true,
+                      })
+                    : "—";
+
+                  const orderTypeStr = (o.orderType || o.order_type || "dining").toLowerCase();
+                  const isDining = orderTypeStr === "dining";
+                  const tableStr = o.tableNumber || o.table_number;
+
+                  let pm = (o.paymentMethod || o.payment_mode || "cash").toUpperCase();
+                  const pStatus = (o.paymentStatus || o.payment_status || "Paid");
+                  const isRefunded = pStatus === "Refunded";
+
+                  const oStatus = o.orderStatus || o.order_status || "Completed";
+                  const orderItems = Array.isArray(o.items) ? o.items : [];
+                  const totalItemsCount = orderItems.reduce((acc, i) => acc + Number(i.quantity || i.qty || 1), 0);
+                  const itemsSummary = orderItems.map((i) => `${t(i.name)} ×${i.quantity || i.qty || 1}`).join(", ");
+                  const grandTotal = safeNumber(o.grandTotal !== undefined ? o.grandTotal : (o.total !== undefined ? o.total : 0));
+
+                  return (
+                    <tr key={o.id} className="hover:bg-[#FFF8F2] transition-colors" data-testid={`order-row-${o.id}`}>
+                      {/* Order Number */}
+                      <td className="px-3 py-2.5 font-mono font-bold text-xs md:text-[13px] text-slate-800 whitespace-nowrap">
+                        #{orderNum}
+                      </td>
+
+                      {/* Date & Time */}
+                      <td className="px-3 py-2.5 text-muted-foreground text-[10.5px] md:text-xs whitespace-nowrap">
+                        {dateDisplay}
+                      </td>
+
+                      {/* Order Type & Table */}
+                      <td className="px-3 py-2.5 whitespace-nowrap">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+                          {isDining ? (
+                            <UtensilsCrossed className="w-3.5 h-3.5 text-[#FF6B00]" />
+                          ) : (
+                            <Package className="w-3.5 h-3.5 text-amber-600" />
+                          )}
+                          <span>{isDining ? "Dine-in" : "Parcel"}</span>
+                          {tableStr && (
+                            <span className="text-[10px] font-mono font-bold text-[#FF6B00] bg-orange-50 border border-orange-200 px-1.5 py-0.5 rounded">
+                              Table {tableStr}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* Items */}
+                      <td className="px-3 py-2.5 max-w-[180px] md:max-w-[240px]">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[9.5px] font-bold uppercase tracking-wider bg-slate-100 text-slate-700 px-1.5 py-0.5 rounded shrink-0">
+                            {totalItemsCount} {totalItemsCount === 1 ? "Item" : "Items"}
+                          </span>
+                          <span className="text-[11px] md:text-xs text-slate-600 truncate" title={itemsSummary}>
+                            {itemsSummary}
+                          </span>
+                        </div>
+                      </td>
+
+                      {/* Payment Method & Payment Status */}
+                      <td className="px-3 py-2.5 whitespace-nowrap">
+                        <div className="flex items-center gap-1">
+                          <span className="text-[9.5px] uppercase tracking-wider font-mono font-bold px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-700">
+                            {pm}
+                          </span>
+                          <span
+                            className={`text-[9.5px] uppercase tracking-wider font-bold px-1.5 py-0.5 rounded ${
+                              isRefunded
+                                ? "bg-amber-100 text-amber-800 border border-amber-300"
+                                : "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            }`}
+                          >
+                            {pStatus}
+                          </span>
+                        </div>
+                      </td>
+
+                      {/* Order Status */}
+                      <td className="px-3 py-2.5 whitespace-nowrap">
+                        <span
+                          className={`text-[10px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full ${
+                            oStatus === "Completed"
+                              ? "bg-emerald-100 text-emerald-800"
+                              : oStatus === "Ready"
+                              ? "bg-blue-100 text-blue-800"
+                              : oStatus === "Preparing"
+                              ? "bg-amber-100 text-amber-800"
+                              : "bg-slate-100 text-slate-700"
+                          }`}
+                        >
+                          {oStatus}
+                        </span>
+                      </td>
+
+                      {/* Total */}
+                      <td className="px-3 py-2.5 text-right font-mono font-extrabold text-xs md:text-sm text-slate-900 whitespace-nowrap">
+                        ₹{safeFixed(grandTotal)}
+                      </td>
+
+                      {/* Actions: View, Print, Refund, Reorder */}
+                      <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                        <div className="flex justify-end items-center gap-1">
+                          {/* View */}
+                          <button
+                            onClick={() => setView(o)}
+                            className="p-1.5 hover:bg-orange-50 rounded-lg text-slate-600 hover:text-[#FF6B00] transition-colors cursor-pointer"
+                            data-testid={`view-${o.id}`}
+                            title="View Details"
+                          >
+                            <Eye className="w-3.5 h-3.5 md:w-4 md:h-4" />
+                          </button>
+
+                          {/* Print */}
+                          <button
+                            onClick={() => reprint(o)}
+                            className="p-1.5 hover:bg-orange-50 rounded-lg text-slate-600 hover:text-[#FF6B00] transition-colors cursor-pointer"
+                            data-testid={`reprint-${o.id}`}
+                            title="Print Receipt"
+                          >
+                            <Printer className="w-3.5 h-3.5 md:w-4 md:h-4" />
+                          </button>
+
+                          {/* Refund */}
+                          {!isRefunded && (
+                            <button
+                              onClick={() => setRefundTarget(o)}
+                              className="p-1.5 hover:bg-amber-50 rounded-lg text-amber-600 hover:text-amber-700 transition-colors cursor-pointer"
+                              data-testid={`refund-${o.id}`}
+                              title="Refund Order"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5 md:w-4 md:h-4" />
+                            </button>
+                          )}
+
+                          {/* Reorder */}
+                          <button
+                            onClick={() => handleReorder(o)}
+                            className="p-1.5 hover:bg-emerald-50 rounded-lg text-emerald-600 hover:text-emerald-700 transition-colors cursor-pointer"
+                            data-testid={`reorder-${o.id}`}
+                            title="Reorder Items"
+                          >
+                            <Repeat className="w-3.5 h-3.5 md:w-4 md:h-4" />
+                          </button>
+
+                          {/* Delete */}
+                          <button
+                            onClick={() => setDeleteTarget(o)}
+                            className="p-1.5 hover:bg-red-50 rounded-lg text-red-500 hover:text-red-700 transition-colors cursor-pointer"
+                            data-testid={`delete-${o.id}`}
+                            title="Delete Order"
+                          >
+                            <Trash2 className="w-3.5 h-3.5 md:w-4 md:h-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
+
+        {/* Pagination Footer */}
+        <div className="border-t border-[#F4E6D7] bg-[#FFFDF9] px-3 sm:px-4 py-2.5 sm:py-3 flex flex-col sm:flex-row items-center justify-between gap-2.5 text-xs text-slate-600 shrink-0 select-none">
+          <div className="flex items-center gap-2">
+            <span>
+              Showing{" "}
+              <span className="font-bold text-slate-800">
+                {filteredOrders.length === 0 ? 0 : (safeCurrentPage - 1) * pageSize + 1}
+              </span>
+              {" "}–{" "}
+              <span className="font-bold text-slate-800">
+                {Math.min(safeCurrentPage * pageSize, filteredOrders.length)}
+              </span>
+              {" "}of{" "}
+              <span className="font-bold text-[#FF6B00]">{filteredOrders.length}</span> bills
+            </span>
+            <span className="text-slate-300">|</span>
+            <div className="flex items-center gap-1.5">
+              <span>Per page:</span>
+              <select
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Number(e.target.value));
+                  setCurrentPage(1);
+                }}
+                className="bg-white border border-[#F4E6D7] rounded-md px-2 py-0.5 font-semibold text-slate-700 focus:outline-none focus:border-[#FF6B00] cursor-pointer"
+                data-testid="page-size-select"
+              >
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            {/* First Page */}
+            <button
+              onClick={() => setCurrentPage(1)}
+              disabled={safeCurrentPage <= 1}
+              className="p-1.5 rounded-lg border border-[#F4E6D7] bg-white text-slate-600 hover:bg-orange-50 hover:text-[#FF6B00] disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
+              title="First Page"
+              data-testid="pagination-first"
+            >
+              <ChevronsLeft className="w-4 h-4" />
+            </button>
+
+            {/* Previous Page */}
+            <button
+              onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+              disabled={safeCurrentPage <= 1}
+              className="px-2.5 py-1 rounded-lg border border-[#F4E6D7] bg-white text-slate-600 hover:bg-orange-50 hover:text-[#FF6B00] disabled:opacity-30 disabled:pointer-events-none transition-colors flex items-center gap-1 font-semibold cursor-pointer"
+              data-testid="pagination-prev"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+              <span>Prev</span>
+            </button>
+
+            {/* Page number indicators */}
+            <div className="flex items-center gap-1 px-2 font-mono font-bold text-xs text-slate-700">
+              <span>Page</span>
+              <span className="text-[#FF6B00] px-1.5 py-0.5 bg-orange-50 rounded border border-orange-200">
+                {safeCurrentPage}
+              </span>
+              <span>of</span>
+              <span>{totalPages}</span>
+            </div>
+
+            {/* Next Page */}
+            <button
+              onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+              disabled={safeCurrentPage >= totalPages}
+              className="px-2.5 py-1 rounded-lg border border-[#F4E6D7] bg-white text-slate-600 hover:bg-orange-50 hover:text-[#FF6B00] disabled:opacity-30 disabled:pointer-events-none transition-colors flex items-center gap-1 font-semibold cursor-pointer"
+              data-testid="pagination-next"
+            >
+              <span>Next</span>
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+
+            {/* Last Page */}
+            <button
+              onClick={() => setCurrentPage(totalPages)}
+              disabled={safeCurrentPage >= totalPages}
+              className="p-1.5 rounded-lg border border-[#F4E6D7] bg-white text-slate-600 hover:bg-orange-50 hover:text-[#FF6B00] disabled:opacity-30 disabled:pointer-events-none transition-colors cursor-pointer"
+              title="Last Page"
+              data-testid="pagination-last"
+            >
+              <ChevronsRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
       </Card>
 
+      {/* View Order Dialog */}
       {view && (
         <Dialog open={true} onOpenChange={(o) => !o && setView(null)}>
-          <DialogContent className="w-[92vw] max-w-md max-h-[90vh] overflow-y-auto flex flex-col items-center bg-neutral-50 p-4 sm:p-6 border border-border rounded-[20px]">
+          <DialogContent className="w-[92vw] max-w-md max-h-[90vh] overflow-y-auto flex flex-col items-center bg-neutral-50 p-4 sm:p-6 border border-border rounded-[24px]">
             <DialogHeader className="w-full text-center mb-1">
-              <DialogTitle className="font-display text-base md:text-lg text-neutral-700">{t("order_details")}</DialogTitle>
+              <DialogTitle className="font-display text-base md:text-lg text-neutral-700">{t("order_details") || "Order Details"}</DialogTitle>
             </DialogHeader>
             <div className="flex justify-center w-full">
               <ReceiptPreview order={view} settings={settings} />
             </div>
-            <Button onClick={() => reprint(view)} className="w-full mt-4 bg-terracota hover:bg-terracota-hover text-white text-xs md:text-sm" data-testid="dialog-reprint">
-              <Printer className="w-4 h-4 mr-2" /> {t("reprint")}
-            </Button>
+            <div className="flex gap-2 w-full mt-4">
+              <Button onClick={() => reprint(view)} className="flex-1 bg-[#FF6B00] hover:bg-[#E05D00] text-white text-xs md:text-sm font-bold py-2.5 rounded-xl cursor-pointer" data-testid="dialog-reprint">
+                <Printer className="w-4 h-4 mr-2" /> {t("reprint") || "Reprint Receipt"}
+              </Button>
+              <Button variant="outline" onClick={() => setView(null)} className="px-4 text-xs md:text-sm font-bold py-2.5 rounded-xl cursor-pointer">
+                Close
+              </Button>
+            </div>
           </DialogContent>
         </Dialog>
       )}
 
+      {/* Confirm Refund Dialog */}
+      <ConfirmDialog
+        open={!!refundTarget}
+        onClose={() => setRefundTarget(null)}
+        onConfirm={handleRefundOrder}
+        title="Refund this order?"
+        message={`Are you sure you want to mark Bill #${refundTarget?.billNumber || refundTarget?.orderNumber || refundTarget?.receipt_no} as Refunded? Total amount: ₹${safeFixed(refundTarget?.grandTotal || refundTarget?.total)}.`}
+        confirmText="Refund"
+        cancelText="Cancel"
+        variant="warning"
+      />
+
+      {/* Confirm Delete Dialog */}
       <ConfirmDialog
         open={!!deleteTarget}
         onClose={() => setDeleteTarget(null)}
@@ -365,6 +761,7 @@ export default function OrderHistory() {
         variant="destructive"
       />
 
+      {/* Confirm Reset Dialog */}
       <ConfirmDialog
         open={showResetConfirm}
         onClose={() => setShowResetConfirm(false)}

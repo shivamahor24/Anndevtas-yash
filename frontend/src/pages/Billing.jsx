@@ -16,7 +16,10 @@ import {
   Package,
   Sparkles,
   Flame,
-  Leaf
+  Leaf,
+  Eye,
+  CheckCircle2,
+  RotateCcw
 } from "lucide-react";
 import { toast } from "sonner";
 import { printReceipt } from "../lib/receipt";
@@ -31,6 +34,8 @@ import { offlineStorage } from "../lib/offlineStorage";
 import { syncQueue } from "../lib/syncQueue";
 import { useOnlineStatus } from "../lib/offlineManager";
 import { getCurrentToken, incrementToken } from "../lib/tokenManager";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../components/ui/dialog";
+import { safeNumber, safeFixed } from "../lib/utils";
 
 // Horizontal category tabs requested
 // const CATEGORY_TABS = [
@@ -56,7 +61,16 @@ export default function Billing() {
   const [menuMode, setMenuMode] = useState("dining"); // No auto-selected menu mode by default
   const [showCartMobile, setShowCartMobile] = useState(false);
   const [customerName, setCustomerName] = useState("");
-  const [cart, setCart] = useState([]);
+  const [customerPhone, setCustomerPhone] = useState("");
+  const [tableNumber, setTableNumber] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [cart, setCart] = useState(() => {
+    try {
+      return offlineStorage.getCart();
+    } catch {
+      return [];
+    }
+  });
   const [discount, setDiscount] = useState(0);
   const [paymentMethod, setPaymentMethod] = useState("cash");
   const [currentToken, setCurrentToken] = useState(getCurrentToken());
@@ -149,9 +163,8 @@ export default function Billing() {
     }
   }, [cart.length]);
 
-  // 1. Remove default cart items on load & listen for token reset
+  // Listen for token reset
   useEffect(() => {
-    setCart([]);
     const handleTokenReset = () => {
       setCurrentToken(getCurrentToken());
       tokenAssignedRef.current = false;
@@ -160,30 +173,12 @@ export default function Billing() {
     return () => window.removeEventListener("tokenReset", handleTokenReset);
   }, []);
 
-  // 5. Storage control
+  // Persist cart to centralized offlineStorage whenever cart changes
   useEffect(() => {
-    if (menuItems.length > 0 && !hasLoadedCart.current) {
-      try {
-        const storageCart = JSON.parse(localStorage.getItem("cart")) || [];
-        const validCart = storageCart.filter((item) =>
-          menuItems.some((m) => m.id === item.id)
-        );
-        setCart(validCart);
-        hasLoadedCart.current = true;
-      } catch (e) {
-        console.warn("Storage control loading exception:", e);
-      }
-    }
-  }, [menuItems]);
-
-  // Persist cart to localStorage when it changes, but only after initial load from storage
-  useEffect(() => {
-    if (hasLoadedCart.current) {
-      try {
-        localStorage.setItem("cart", JSON.stringify(cart));
-      } catch (e) {
-        console.warn("Failed to save cart to storage:", e);
-      }
+    try {
+      offlineStorage.saveCart(cart);
+    } catch (e) {
+      console.warn("Failed to save cart to storage:", e);
     }
   }, [cart]);
 
@@ -359,21 +354,28 @@ export default function Billing() {
 
   const updateQty = useCallback((keyOrId, delta) => {
     setCart((prev) =>
-      prev.map((i) =>
-        (i._key === keyOrId || i.id === keyOrId)
-          ? { ...i, quantity: Math.max(1, i.quantity + delta), qty: Math.max(1, i.qty + delta) }
-          : i
-      )
+      prev
+        .map((i) => {
+          if (i._key === keyOrId || i.id === keyOrId || i.menu_item_id === keyOrId || i.productId === keyOrId) {
+            const currentQty = i.quantity || i.qty || 1;
+            const nextQty = currentQty + delta;
+            if (nextQty <= 0) return null;
+            return { ...i, quantity: nextQty, qty: nextQty };
+          }
+          return i;
+        })
+        .filter(Boolean)
     );
   }, []);
 
   const removeLine = useCallback((keyOrId) => {
-    setCart((prev) => prev.filter((i) => i._key !== keyOrId && i.id !== keyOrId));
+    setCart((prev) => prev.filter((i) => i._key !== keyOrId && i.id !== keyOrId && i.menu_item_id !== keyOrId && i.productId !== keyOrId));
   }, []);
 
   const clear = useCallback(() => {
     setCart([]);
     setDiscount(0);
+    offlineStorage.clearCart();
   }, []);
 
   const subtotal = useMemo(() => {
@@ -550,106 +552,197 @@ export default function Billing() {
   const showGlobalMenus = true;
 
   const checkout = useCallback(async (mode) => {
+    if (isSubmitting) return;
     if (!cart.length) {
-      toast.error(t("no_items_in_cart"));
+      toast.error(t("no_items_in_cart") || "Cart is empty");
       return;
     }
-    const currentToken = getCurrentToken();
-    const payload = {
-      order_type: menuMode || "dining",
-      items: cart.map((item) => ({
-        menu_item_id: item.id || item.menu_item_id,
-        name: item.name,
-        price: item.price,
-        qty: item.qty || item.quantity,
-        cgst_rate: item.cgst_rate ?? cgstRate,
-        sgst_rate: item.sgst_rate ?? sgstRate,
-        tax_rate: (item.cgst_rate ?? cgstRate) + (item.sgst_rate ?? sgstRate),
-        is_thali: item.is_thali || item.category === "THALI",
-        rules: item.rules || null,
-        thali_groups: item.thali_groups || item.thali_rules || item.rules || null,
-        thali_selections: item.thali_selections || item.selections || null,
-        thali_extras: item.thali_extras || item.extras || "",
-        fixedInclusions: item.fixedInclusions || item.thali_extras || item.extras || "",
-        sub_items: item.sub_items || item.subItems || item.included_items || item.includedItems || null,
-        addons: item.addons || item.add_ons || item.addOns || null,
-        included_items: item.included_items || item.includedItems || null,
-        extra_bread: item.extra_bread || 0,
-        extra_bread_charge: item.extra_bread_charge || 0,
-      })),
-      discount: discount,
-      payment_mode: mode,
-      customer_name: customerName.trim() || undefined,
-      token_no: currentToken,
-    };
+    setIsSubmitting(true);
+    try {
+      const orderNum = offlineStorage.getNextOrderNumber();
+      const currentToken = getCurrentToken();
+      const orderType = menuMode || "dining";
 
-    if (!isOnline) {
-      const queued = syncQueue.enqueue(payload);
-      const offlineOrder = {
-        receipt_no: queued.id,
-        order_type: menuMode || "dining",
-        items: payload.items,
+      // Build complete item objects
+      const items = cart.map((item) => {
+        const q = Number(item.qty || item.quantity || 1);
+        const p = Number(item.price || 0);
+        const ebCharge = Number(item.extra_bread_charge || 0);
+        const itemTotal = p * q + ebCharge * q;
+        const pId = item.productId || item.menu_item_id || item.id;
+        return {
+          productId: pId,
+          id: pId,
+          menu_item_id: pId,
+          name: item.name,
+          quantity: q,
+          qty: q,
+          price: p,
+          total: itemTotal,
+          cgst_rate: item.cgst_rate ?? cgstRate,
+          sgst_rate: item.sgst_rate ?? sgstRate,
+          tax_rate: (item.cgst_rate ?? cgstRate) + (item.sgst_rate ?? sgstRate),
+          is_thali: Boolean(item.is_thali || item.category === "THALI"),
+          rules: item.rules || null,
+          thali_groups: item.thali_groups || item.thali_rules || item.rules || null,
+          thali_selections: item.thali_selections || item.selections || null,
+          thali_extras: item.thali_extras || item.extras || "",
+          fixedInclusions: item.fixedInclusions || item.thali_extras || item.extras || "",
+          sub_items: item.sub_items || item.subItems || item.included_items || item.includedItems || null,
+          addons: item.addons || item.add_ons || item.addOns || null,
+          included_items: item.included_items || item.includedItems || null,
+          extra_bread: Number(item.extra_bread || 0),
+          extra_bread_charge: ebCharge,
+        };
+      });
+
+      const now = new Date().toISOString();
+      const newOrder = {
+        id: `ord_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        billNumber: orderNum,
+        orderNumber: orderNum,
+        receipt_no: orderNum,
+        createdAt: now,
+        created_at: now,
+        updatedAt: now,
+        updated_at: now,
+        paid_at: now,
+        orderType: orderType,
+        order_type: orderType,
+        tableNumber: tableNumber ? String(tableNumber).trim() : "",
+        table_number: tableNumber ? String(tableNumber).trim() : "",
+        customerName: customerName.trim(),
+        customer_name: customerName.trim(),
+        customerPhone: customerPhone.trim(),
+        customer_phone: customerPhone.trim(),
+        items: items,
         subtotal: subtotal,
+        discount: discount,
         cgst: cgst,
         sgst: sgst,
         tax: gst,
-        cgst_rate: cgstRate,
-        sgst_rate: sgstRate,
-        discount: discount,
+        grandTotal: total,
         total: total,
+        paymentMethod: mode,
         payment_mode: mode,
-        customer_name: customerName,
-        created_at: new Date().toISOString(),
-        _offline: true,
+        paymentStatus: "Paid",
+        payment_status: "Paid",
+        orderStatus: "Completed",
+        order_status: "Completed",
+        cashier: user?.name || user?.email || "Cashier",
+        cashier_name: user?.name || user?.email || "Cashier",
+        cashier_email: user?.email || "",
+        branchId: "main",
         token_no: currentToken,
       };
-      toast.warning(`Offline order saved locally. Will sync when online.`);
-      if (settings?.auto_print !== false) {
-        printReceipt({ order: offlineOrder, settings, menuMode, });
+
+      // 1. Save to centralized offline storage first (guarantees offline-first durability)
+      const savedOrder = offlineStorage.saveOrder(newOrder);
+
+      // 2. Verify save succeeded
+      const verified = offlineStorage.getOrderById(savedOrder.id);
+      if (!verified) {
+        throw new Error("Failed to verify order storage");
       }
+
+      // 3. Clear cart ONLY after successful saving
       clear();
       setCustomerName("");
+      setCustomerPhone("");
+      setTableNumber("");
       setShowCartMobile(false);
-      return;
-    }
 
-    try {
-      const { data } = await api.post("/orders", payload);
-      toast.success(`${t("checkout_success")} · #${data.receipt_no} · ₹${data.total} (${mode.toUpperCase()})`);
+      // Increment token for next order
+      incrementToken();
+      setCurrentToken(getCurrentToken());
+
+      // Success notification
+      toast.success(`Bill #${savedOrder.billNumber || savedOrder.orderNumber} placed successfully! · ₹${safeFixed(savedOrder.grandTotal)} (${mode.toUpperCase()})`);
+
+      // 5. Auto-print if enabled
       if (settings?.auto_print !== false) {
         try {
-          await printReceipt({ order: data, settings, menuMode });
+          await printReceipt({ order: savedOrder, settings, menuMode });
         } catch (printErr) {
           console.error("Auto-print error after checkout:", printErr);
         }
       }
-      clear();
-      setCustomerName("");
-      setShowCartMobile(false);
-      refresh();
-    } catch (e) {
-      if (!e.response) {
-        syncQueue.enqueue(payload);
-        toast.warning(`Server unreachable — order queued for sync.`);
-        clear();
-        setCustomerName("");
-        setShowCartMobile(false);
+
+      // 6. Background sync to server if online, or queue for sync
+      const payload = {
+        id: savedOrder.id,
+        order_type: orderType,
+        items: savedOrder.items.map((i) => ({
+          menu_item_id: i.productId,
+          name: i.name,
+          price: i.price,
+          qty: i.quantity,
+          cgst_rate: i.cgst_rate,
+          sgst_rate: i.sgst_rate,
+          tax_rate: i.tax_rate,
+          is_thali: i.is_thali,
+          rules: i.rules,
+          thali_groups: i.thali_groups,
+          thali_selections: i.thali_selections,
+          thali_extras: i.thali_extras,
+          fixedInclusions: i.fixedInclusions,
+          sub_items: i.sub_items,
+          addons: i.addons,
+          included_items: i.included_items,
+          extra_bread: i.extra_bread,
+          extra_bread_charge: i.extra_bread_charge,
+        })),
+        discount: discount,
+        payment_mode: mode,
+        customer_name: customerName.trim() || undefined,
+        customer_phone: customerPhone.trim() || undefined,
+        table_number: tableNumber.trim() || undefined,
+        token_no: currentToken,
+        receipt_no: orderNum,
+        bill_number: orderNum,
+      };
+
+      if (isOnline) {
+        api.post("/orders", payload)
+          .then(({ data }) => {
+            if (data?.id) {
+              offlineStorage.updateOrder(savedOrder.id, { server_id: data.id });
+            }
+          })
+          .catch((err) => {
+            console.warn("Background server sync failed, queued offline:", err);
+            syncQueue.enqueue(payload);
+          });
       } else {
-        const detail = e?.response?.data?.detail;
-        let msg = t("checkout_failed");
-        if (typeof detail === "string") {
-          msg = detail;
-        } else if (Array.isArray(detail)) {
-          msg = detail.map((d) => d.msg || JSON.stringify(d)).join(", ");
-        } else if (detail) {
-          msg = JSON.stringify(detail);
-        } else if (e?.message) {
-          msg = e.message;
-        }
-        toast.error(msg);
+        syncQueue.enqueue(payload);
       }
+    } catch (e) {
+      console.error("Checkout failed:", e);
+      toast.error(e.message || t("checkout_failed") || "Failed to process checkout");
+    } finally {
+      setIsSubmitting(false);
     }
-  }, [cart, subtotal, gst, total, discount, isOnline, settings, clear, refresh, customerName, t, cgst, cgstRate, menuMode, sgst, sgstRate]);
+  }, [
+    isSubmitting,
+    cart,
+    cgstRate,
+    sgstRate,
+    menuMode,
+    tableNumber,
+    customerName,
+    customerPhone,
+    subtotal,
+    discount,
+    cgst,
+    sgst,
+    gst,
+    total,
+    user,
+    settings,
+    isOnline,
+    clear,
+    t,
+  ]);
 
   return (
     <div className="h-full grid grid-cols-12 gap-2.5 sm:gap-3 lg:gap-4 bg-[#FAF7F2] p-1 sm:p-2 overflow-hidden billing-responsive-scale container billing-page-container">
@@ -943,10 +1036,41 @@ export default function Billing() {
               {cart.length} {cart.length === 1 ? "Line in Order" : "Lines in Order"}
             </div>
           </div>
-          <div className="mt-3">
-            <div className="bg-white/10 text-white/90 rounded-xl px-3 h-9 flex items-center text-xs select-none">
-              <span>Token No: <span className="font-extrabold text-white ml-1">#{currentToken}</span></span>
+          <div className="mt-2.5 flex items-center gap-2">
+            <div className="bg-white/10 text-white/90 rounded-xl px-2.5 h-8 flex items-center text-xs select-none">
+              <span>Token: <span className="font-extrabold text-white ml-1">#{currentToken}</span></span>
             </div>
+            <div className="bg-white/15 text-white uppercase text-[10px] font-extrabold px-2.5 h-8 rounded-xl flex items-center select-none tracking-wider">
+              {menuMode === "dining" ? "Dine-in" : "Parcel"}
+            </div>
+          </div>
+
+          {/* Table No & Customer Inputs */}
+          <div className="mt-2.5 grid grid-cols-2 gap-1.5 pt-2 border-t border-white/15">
+            {menuMode === "dining" ? (
+              <Input
+                placeholder="Table No. (e.g. 05)"
+                value={tableNumber}
+                onChange={(e) => setTableNumber(e.target.value)}
+                className="h-7 text-xs bg-white/10 border-white/20 text-white placeholder:text-white/60 focus:bg-white/20 rounded-lg px-2"
+                data-testid="cart-table-no"
+              />
+            ) : (
+              <Input
+                placeholder="Customer Phone"
+                value={customerPhone}
+                onChange={(e) => setCustomerPhone(e.target.value)}
+                className="h-7 text-xs bg-white/10 border-white/20 text-white placeholder:text-white/60 focus:bg-white/20 rounded-lg px-2"
+                data-testid="cart-customer-phone"
+              />
+            )}
+            <Input
+              placeholder="Customer Name"
+              value={customerName}
+              onChange={(e) => setCustomerName(e.target.value)}
+              className="h-7 text-xs bg-white/10 border-white/20 text-white placeholder:text-white/60 focus:bg-white/20 rounded-lg px-2"
+              data-testid="cart-customer-name"
+            />
           </div>
         </div>
 
@@ -1021,15 +1145,15 @@ export default function Billing() {
           <div className="space-y-2 text-xs text-slate-600">
             <div className="flex justify-between items-center">
               <span className="font-medium text-slate-600">{isParcel ? "Subtotal (Incl. GST)" : "Subtotal"}</span>
-              <span className="font-mono font-bold text-slate-800">₹{subtotal.toFixed(2)}</span>
+              <span className="font-mono font-bold text-slate-800">₹{safeFixed(subtotal)}</span>
             </div>
             <div className="flex justify-between items-center text-slate-500">
               <span>CGST ({cgstRate}%{isParcel ? " incl." : ""})</span>
-              <span className="font-mono">₹{cgst.toFixed(2)}</span>
+              <span className="font-mono">₹{safeFixed(cgst)}</span>
             </div>
             <div className="flex justify-between items-center text-slate-500">
               <span>SGST ({sgstRate}%{isParcel ? " incl." : ""})</span>
-              <span className="font-mono">₹{sgst.toFixed(2)}</span>
+              <span className="font-mono">₹{safeFixed(sgst)}</span>
             </div>
             <div className="flex justify-between items-center">
               <span className="font-medium text-slate-600">Discount</span>
@@ -1047,49 +1171,64 @@ export default function Billing() {
             </div>
             <div className="flex justify-between items-center text-base font-extrabold text-slate-900 pt-2.5 border-t border-dashed border-slate-200">
               <span>Total</span>
-              <span className="font-mono text-xl font-black text-[#FF6B00]">₹{total.toFixed(2)}</span>
+              <span className="font-mono text-xl font-black text-[#FF6B00]">₹{safeFixed(total)}</span>
             </div>
           </div>
 
           <div className="grid grid-cols-3 gap-1.5 pt-1">
             <button
+              disabled={cart.length === 0 || isSubmitting}
               onClick={() => {
                 setPaymentMethod("cash");
                 checkout("cash");
               }}
-              className={`flex items-center justify-center gap-1 py-2 px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold rounded-full transition-all border select-none active:scale-95 ${paymentMethod === "cash"
+              data-testid="pay-cash-btn"
+              className={`flex items-center justify-center gap-1 py-2.5 px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold rounded-full transition-all border select-none active:scale-95 ${
+                cart.length === 0 || isSubmitting
+                  ? "opacity-50 cursor-not-allowed bg-slate-100 text-slate-400 border-slate-200"
+                  : paymentMethod === "cash"
                   ? "bg-[#FF6B00] text-white border-[#FF6B00] shadow-md shadow-orange-500/20"
                   : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100 hover:text-slate-800"
-                }`}
+              }`}
             >
               <Banknote className="w-3.5 h-3.5 shrink-0" />
-              <span>CASH</span>
+              <span>{isSubmitting ? "..." : "CASH"}</span>
             </button>
             <button
+              disabled={cart.length === 0 || isSubmitting}
               onClick={() => {
                 setPaymentMethod("upi");
                 checkout("upi");
               }}
-              className={`flex items-center justify-center gap-1 py-2 px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold rounded-full transition-all border select-none active:scale-95 ${paymentMethod === "upi"
+              data-testid="pay-upi-btn"
+              className={`flex items-center justify-center gap-1 py-2.5 px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold rounded-full transition-all border select-none active:scale-95 ${
+                cart.length === 0 || isSubmitting
+                  ? "opacity-50 cursor-not-allowed bg-slate-100 text-slate-400 border-slate-200"
+                  : paymentMethod === "upi"
                   ? "bg-[#FF6B00] text-white border-[#FF6B00] shadow-md shadow-orange-500/20"
                   : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100 hover:text-slate-800"
-                }`}
+              }`}
             >
               <Smartphone className="w-3.5 h-3.5 shrink-0" />
-              <span>UPI</span>
+              <span>{isSubmitting ? "..." : "UPI"}</span>
             </button>
             <button
+              disabled={cart.length === 0 || isSubmitting}
               onClick={() => {
                 setPaymentMethod("card");
                 checkout("card");
               }}
-              className={`flex items-center justify-center gap-1 py-2 px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold rounded-full transition-all border select-none active:scale-95 ${paymentMethod === "card"
+              data-testid="pay-card-btn"
+              className={`flex items-center justify-center gap-1 py-2.5 px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold rounded-full transition-all border select-none active:scale-95 ${
+                cart.length === 0 || isSubmitting
+                  ? "opacity-50 cursor-not-allowed bg-slate-100 text-slate-400 border-slate-200"
+                  : paymentMethod === "card"
                   ? "bg-[#FF6B00] text-white border-[#FF6B00] shadow-md shadow-orange-500/20"
                   : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100 hover:text-slate-800"
-                }`}
+              }`}
             >
               <CreditCard className="w-3.5 h-3.5 shrink-0" />
-              <span>CARD</span>
+              <span>{isSubmitting ? "..." : "CARD"}</span>
             </button>
           </div>
         </div>

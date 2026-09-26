@@ -4,6 +4,7 @@ import en from "../translations/en.json";
 import gu from "../translations/gu.json";
 import bilingual from "../translations/bilingual.json";
 import { toast } from "sonner";
+import { safeNumber, safeFixed } from "./utils";
 
 const translations = { en, gu, bilingual };
 
@@ -306,10 +307,10 @@ function buildReceiptBlock({
   // ITEMS (Full usable 72mm width 2-column table layout)
   const itemsHTML = (order.items || [])
     .map((i) => {
-      const lineTotal = (
-        Number(i.price || 0) *
-        Number(i.qty || 0)
-      ).toFixed(2);
+      const lineTotal = safeFixed(
+        safeNumber(i.price) *
+        safeNumber(i.qty)
+      );
 
       const subItems = getItemSubItems(i, t, menu);
       const subline = subItems.map(
@@ -328,7 +329,7 @@ function buildReceiptBlock({
           </tr>
           <tr>
             <td colspan="2" style="text-align:left;font-size:11px;color:#111;padding:0 0 1px 0;">
-              ${i.qty} x ₹${Number(i.price).toFixed(2)}
+              ${safeNumber(i.qty)} x ₹${safeFixed(i.price)}
             </td>
           </tr>
           ${subline.length > 0
@@ -438,7 +439,7 @@ function buildReceiptBlock({
             ${t("subtotal")}${isParcelOrder ? " (Incl. GST)" : ""}
           </td>
           <td style="width:42%;text-align:right;font-weight:bold;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
-            ₹${Number(order.subtotal || 0).toFixed(2)}
+            ₹${safeFixed(order.subtotal)}
           </td>
         </tr>
 
@@ -449,7 +450,7 @@ function buildReceiptBlock({
                     CGST (${cgstRate}%${isParcelOrder ? " incl." : ""})
                   </td>
                   <td style="width:42%;text-align:right;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
-                    ₹${Number(cgstVal).toFixed(2)}
+                    ₹${safeFixed(cgstVal)}
                   </td>
                 </tr>
 
@@ -458,21 +459,21 @@ function buildReceiptBlock({
                     SGST (${sgstRate}%${isParcelOrder ? " incl." : ""})
                   </td>
                   <td style="width:42%;text-align:right;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
-                    ₹${Number(sgstVal).toFixed(2)}
+                    ₹${safeFixed(sgstVal)}
                   </td>
                 </tr>
               `
       : ""
     }
 
-        ${order.discount > 0
+        ${safeNumber(order.discount) > 0
       ? `
               <tr>
                 <td style="width:58%;text-align:left;padding:1.5px 0;">
                   ${t("discount")}
                 </td>
                 <td style="width:42%;text-align:right;padding:1.5px 1px 1.5px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
-                  -₹${Number(order.discount).toFixed(2)}
+                  -₹${safeFixed(order.discount)}
                 </td>
               </tr>
             `
@@ -489,7 +490,7 @@ function buildReceiptBlock({
             ${t("total_uppercase")}
           </td>
           <td style="width:55%;text-align:right;font-size:15px;font-weight:800;padding:2px 1px 2px 0;white-space:nowrap;font-variant-numeric:tabular-nums;">
-            ₹${Number(finalTotal || 0).toFixed(2)}
+            ₹${safeFixed(finalTotal)}
           </td>
         </tr>
       </table>
@@ -597,7 +598,7 @@ function buildKitchenReceiptBlock({
     }
 
         <tr>
-          <td style="width:46%;text-align:left;padding:1px 0;">BILL NO:</td>
+          <td style="width:46%;text-align:left;padding:1px 0;">BILL NUMBER:</td>
           <td style="width:54%;text-align:right;font-weight:bold;padding:1px 1px 1px 0;white-space:nowrap;">
             ${receiptNoFormatted}
           </td>
@@ -679,10 +680,16 @@ export async function printReceipt({ order, settings, menu, menuMode }) {
   hours = hours ? hours : 12;
   const timeStr = `${pad(hours)}:${minutes} ${ampm}`;
 
-  // Formatted receipt number based on prefix and padding settings
-  const prefix = effectiveSettings?.receipt_prefix || '';
-  const paddingCount = Number(effectiveSettings?.receipt_padding) || 6;
-  const receiptNoFormatted = `${prefix}${String(order.receipt_no ?? '').padStart(paddingCount, '0')}`;
+  // Customer-facing Bill Number: simple sequential number (#1, #2, #3...)
+  const rawBillNum = order.billNumber ?? order.orderNumber ?? order.receipt_no;
+  let cleanBillNum = null;
+  if (rawBillNum !== undefined && rawBillNum !== null && rawBillNum !== "") {
+    const num = parseInt(String(rawBillNum).replace(/[^0-9]/g, ""), 10);
+    if (!isNaN(num) && num > 0) {
+      cleanBillNum = (num >= 1001 && num < 2000) ? num - 1000 : num;
+    }
+  }
+  const receiptNoFormatted = cleanBillNum !== null ? `#${cleanBillNum}` : "#—";
 
   const is58 = Number(effectiveSettings?.paper_width) === 58;
   const paperWidth = is58 ? "58mm" : "80mm";

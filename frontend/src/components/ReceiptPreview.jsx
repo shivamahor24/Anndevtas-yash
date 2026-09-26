@@ -2,6 +2,7 @@ import React, { useMemo } from "react";
 import { Plus, Minus, Trash2 } from "lucide-react";
 import { useLanguage } from "../context/LanguageContext";
 import { getCurrentToken } from "../lib/tokenManager";
+import { safeNumber, safeFixed } from "../lib/utils";
 
 function getItemSubItems(item, t, menuList = []) {
   if (!item) return [];
@@ -204,10 +205,16 @@ export default function ReceiptPreview({
   const prefix = settings?.receipt_prefix || '';
   const paddingCount = Number(settings?.receipt_padding) || 6;
 
-  // Format receipt number: if order is being billed (no receipt_no yet), show PENDING
-  const receiptNoFormatted = order.receipt_no !== undefined
-    ? `${prefix}${String(order.receipt_no).padStart(paddingCount, '0')}`
-    : `${prefix}${"?".repeat(paddingCount)}`;
+  // Format customer-facing Bill Number: simple sequential number (#1, #2, #3...)
+  const rawBillNum = order.billNumber ?? order.orderNumber ?? order.receipt_no;
+  let cleanBillNum = null;
+  if (rawBillNum !== undefined && rawBillNum !== null && rawBillNum !== "") {
+    const num = parseInt(String(rawBillNum).replace(/[^0-9]/g, ""), 10);
+    if (!isNaN(num) && num > 0) {
+      cleanBillNum = (num >= 1001 && num < 2000) ? num - 1000 : num;
+    }
+  }
+  const receiptNoFormatted = cleanBillNum !== null ? `#${cleanBillNum}` : "#—";
 
   const taxLabel = settings?.tax_label || 'GST';
   const gstRate = settings?.gst_rate ?? 5.0;
@@ -413,10 +420,10 @@ export default function ReceiptPreview({
               <div key={key} className="group relative">
                 <div className="flex justify-between font-bold">
                   <span>{t(line.name)}</span>
-                  <span>Rs.{(line.price * line.qty).toFixed(2)}</span>
+                  <span>Rs.{safeFixed(safeNumber(line.price) * safeNumber(line.qty))}</span>
                 </div>
                 <div className="flex justify-between text-[11px] text-[#333]">
-                  <span>{line.qty} x Rs.{Number(line.price).toFixed(2)}</span>
+                  <span>{safeNumber(line.qty)} x Rs.{safeFixed(line.price)}</span>
                 </div>
 
                 {/* Sub-items / Addons list */}
@@ -454,7 +461,7 @@ export default function ReceiptPreview({
         <div className="space-y-1 text-[#000]">
           <div className="flex justify-between">
             <span>{t("subtotal")}{isParcel ? " (Incl. GST)" : ""}</span>
-            <span>Rs.{Number(order.subtotal || 0).toFixed(2)}</span>
+            <span>Rs.{safeFixed(order.subtotal)}</span>
           </div>
           {settings?.show_gst !== false && (() => {
             const cgstRate = order.cgst_rate ?? settings?.cgst_rate ?? ((settings?.gst_rate ?? 5.0) / 2);
@@ -465,8 +472,8 @@ export default function ReceiptPreview({
             let sgstVal = order.sgst;
 
             if (cgstVal === undefined || sgstVal === undefined) {
-              const sub = Number(order.subtotal || 0);
-              const totalRate = cgstRate + sgstRate;
+              const sub = safeNumber(order.subtotal);
+              const totalRate = safeNumber(cgstRate) + safeNumber(sgstRate);
               if (isParcelOrder) {
                 if (totalRate > 0) {
                   const base = sub / (1 + totalRate / 100);
@@ -487,19 +494,19 @@ export default function ReceiptPreview({
               <>
                 <div className="flex justify-between">
                   <span>CGST ({cgstRate}%{isParcelOrder ? " incl." : ""})</span>
-                  <span>Rs.{Number(cgstVal).toFixed(2)}</span>
+                  <span>Rs.{safeFixed(cgstVal)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span>SGST ({sgstRate}%{isParcelOrder ? " incl." : ""})</span>
-                  <span>Rs.{Number(sgstVal).toFixed(2)}</span>
+                  <span>Rs.{safeFixed(sgstVal)}</span>
                 </div>
               </>
             );
           })()}
-          {order.discount > 0 && (
+          {safeNumber(order.discount) > 0 && (
             <div className="flex justify-between text-[#d32f2f]">
               <span>{t("discount")}</span>
-              <span>-Rs.{Number(order.discount).toFixed(2)}</span>
+              <span>-Rs.{safeFixed(order.discount)}</span>
             </div>
           )}
         </div>
@@ -508,7 +515,7 @@ export default function ReceiptPreview({
 
         <div className="flex justify-between font-extrabold text-sm py-0.5">
           <span>{t("total_uppercase")}</span>
-          <span>Rs.{Number(order.total || 0).toFixed(2)}</span>
+          <span>Rs.{safeFixed(order.total !== undefined ? order.total : order.grandTotal)}</span>
         </div>
 
         <div className="my-2 border-t border-dashed border-black" />

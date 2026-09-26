@@ -1,6 +1,7 @@
 import React from "react";
 import { Sparkles, Plus } from "lucide-react";
 import { useLanguage } from "../context/LanguageContext";
+import { safeFixed } from "../lib/utils";
 
 function MenuTileComponent({ item, onClick, menuMode = "dining", gstRate = 5.0, displayedPrice }) {
   const { t } = useLanguage();
@@ -58,7 +59,7 @@ function MenuTileComponent({ item, onClick, menuMode = "dining", gstRate = 5.0, 
         {item.current_stock !== null && item.current_stock !== undefined && (
           <span className={`rounded-full px-2 py-0.5 text-[9.5px] font-bold ${stockColor}`}>
             {item.current_stock % 1 !== 0
-              ? Number(item.current_stock).toFixed(3)
+              ? safeFixed(item.current_stock, 3)
               : item.current_stock}
           </span>
         )}

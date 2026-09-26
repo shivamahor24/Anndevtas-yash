@@ -4,6 +4,7 @@ import { Button } from "../components/ui/button";
 // eslint-disable-next-line no-unused-vars
 import { Check, Sparkles, ShieldCheck, ChevronDown, ChevronRight, Plus, Minus, Info } from "lucide-react";
 import { useLanguage } from "../context/LanguageContext";
+import { safeNumber, safeFixed } from "../lib/utils";
 
 function translateExtras(extrasStr, t) {
   if (!extrasStr) return [];
@@ -412,7 +413,7 @@ export default function ThaliBuilder({ open, onClose, thali, thaliItem, menu, ca
                     <span className="font-bold text-slate-800">Total Rotis Consumed:</span>
                     {extraBread > 0 && (
                       <p className="text-[11px] text-amber-800 font-semibold">
-                        +{extraBread} Extra Roti (₹{extraBreadPrice}/roti) = +₹{extraBreadCharge.toFixed(2)}
+                        +{extraBread} Extra Roti (₹{extraBreadPrice}/roti) = +₹{safeFixed(extraBreadCharge)}
                       </p>
                     )}
                   </div>
@@ -449,7 +450,7 @@ export default function ThaliBuilder({ open, onClose, thali, thaliItem, menu, ca
               Total Order Price
             </div>
             <div className="font-mono font-black text-2xl text-[#FF6B00]">
-              ₹{totalPrice.toFixed(2)}
+              ₹{safeFixed(totalPrice)}
             </div>
           </div>
 

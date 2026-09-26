@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useLanguage } from "../../context/LanguageContext";
+import { safeNumber, safeFixed } from "../../lib/utils";
 
 const PO_STATUS_STYLES = {
   draft: { label: "Draft", cls: "bg-gray-100 text-gray-600 border-gray-200", icon: Clock },
@@ -260,7 +261,7 @@ export default function PurchaseOrders() {
                         <td className="p-2 font-medium">{it.product_name}</td>
                         <td className="p-2 text-right font-mono">{it.qty}</td>
                         <td className="p-2 text-right font-mono">₹{it.unit_cost}</td>
-                        <td className="p-2 text-right font-mono font-semibold">₹{(it.qty * it.unit_cost).toFixed(2)}</td>
+                        <td className="p-2 text-right font-mono font-semibold">₹{safeFixed(safeNumber(it.qty) * safeNumber(it.unit_cost))}</td>
                       </tr>
                     ))}
                   </tbody>

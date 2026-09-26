@@ -251,6 +251,21 @@ class MenuItemIn(BaseModel):
     item_gst_rate: float = 0.0
 
 
+class BulkImportItem(BaseModel):
+    name: str
+    category: str
+    price: float
+    description: Optional[str] = ""
+    tax_rate: Optional[float] = 0.0
+    available: Optional[bool] = True
+
+
+class BulkImportIn(BaseModel):
+    items: List[BulkImportItem]
+    skip_duplicates: Optional[bool] = False
+    menu_destination: Optional[str] = "dining"
+
+
 class TemplateIn(BaseModel):
     name: str
     item_ids: List[str]
@@ -281,6 +296,9 @@ class OrderItem(BaseModel):
 
 
 class OrderIn(BaseModel):
+    id: Optional[str] = None
+    receipt_no: Optional[int] = None
+    bill_number: Optional[int] = None
     items: List[OrderItem]
     discount: float = 0.0
     payment_mode: str = "cash"
@@ -1413,6 +1431,83 @@ async def reset_menu_availability(_: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+@api.post("/menu/bulk-import")
+async def bulk_import_menu(body: BulkImportIn, _: dict = Depends(require_roles("admin"))):
+    db = await get_db()
+    tenant = _tenant()
+    
+    # 1. Fetch existing categories
+    existing_cats = await _fetchall(db, "SELECT id, name FROM categories WHERE tenant_db = ?", (tenant,))
+    cat_map = {c["name"].strip().lower(): c["id"] for c in existing_cats}
+    
+    # 2. Fetch existing menu items to handle duplicates
+    existing_menu = await _fetchall(db, "SELECT id, name FROM menu WHERE tenant_db = ?", (tenant,))
+    menu_map = {m["name"].strip().lower(): m["id"] for m in existing_menu}
+    
+    created_count = 0
+    updated_count = 0
+    created_cats_count = 0
+    
+    for row in body.items:
+        clean_name = row.name.strip()
+        if not clean_name:
+            continue
+        clean_cat = row.category.strip()
+        if not clean_cat:
+            clean_cat = "General"
+            
+        # Check or automatically create category
+        cat_key = clean_cat.lower()
+        if cat_key not in cat_map:
+            new_cat_id = new_id()
+            await _execute(db, "INSERT INTO categories (id, tenant_db, name, sort_order) VALUES (?, ?, ?, 0)",
+                           (new_cat_id, tenant, clean_cat))
+            cat_map[cat_key] = new_cat_id
+            created_cats_count += 1
+            
+        target_cat_id = cat_map[cat_key]
+        dest = (body.menu_destination or "dining").strip().lower()
+        if dest not in ("dining", "parcel", "both"):
+            dest = "dining"
+        m_type = dest
+        tax = float(row.tax_rate or 0)
+        gst_enabled = 1 if tax > 0 else 0
+        desc = row.description or ""
+        
+        menu_key = clean_name.lower()
+        if menu_key in menu_map:
+            if body.skip_duplicates:
+                continue
+            # Update existing item
+            mid = menu_map[menu_key]
+            await _execute(db,
+                """UPDATE menu SET category_id = ?, price = ?, available = ?, is_thali = ?,
+                   thali_extras = ?, menuType = ?, menu_type = ?, gst_enabled = ?, item_gst_rate = ?
+                   WHERE id = ? AND tenant_db = ?""",
+                (target_cat_id, float(row.price), 1 if row.available else 0, 1 if is_thali else 0,
+                 desc, m_type, m_type, gst_enabled, tax, mid, tenant))
+            updated_count += 1
+        else:
+            mid = new_id()
+            await _execute(db,
+                """INSERT INTO menu (id, tenant_db, name, category_id, price, available, is_thali, thali_groups, thali_extras,
+                   portion_weight_kg, menuType, menu_type, gst_enabled, item_gst_rate)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, 0, ?, ?, ?, ?)""",
+                (mid, tenant, clean_name, target_cat_id, float(row.price),
+                 1 if row.available else 0, 1 if is_thali else 0,
+                 desc, m_type, m_type, gst_enabled, tax))
+            menu_map[menu_key] = mid
+            created_count += 1
+            
+    return {
+        "ok": True,
+        "created_items": created_count,
+        "updated_items": updated_count,
+        "created_categories": created_cats_count,
+        "total_processed": created_count + updated_count
+    }
+
+
 
 # ------- Templates (Daily Menu snapshots) -------
 @api.get("/templates")
@@ -1565,10 +1660,28 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
 
     order_type = (body.order_type or "dining").lower()
     totals = _compute_totals(items, body.discount, default_cgst, default_sgst, order_type)
-    rn = await _next_receipt_number()
+    
+    # Bill number determination (sequential, starting at 1, no 1000-series)
+    client_rn = body.receipt_no or body.bill_number
+    if client_rn is not None and int(client_rn) > 0:
+        rn = int(client_rn)
+        if 1001 <= rn < 2000:
+            rn = rn - 1000
+        # Sync the server counter so subsequent orders don't clash
+        row = await _fetchone(db, "SELECT value FROM counters WHERE id = ? AND tenant_db = ?", ("receipt", tenant))
+        if row:
+            cur_val = int(row["value"])
+            if rn > cur_val:
+                await _execute(db, "UPDATE counters SET value = ? WHERE id = ? AND tenant_db = ?", (rn, "receipt", tenant))
+        else:
+            await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, rn))
+    else:
+        rn = await _next_receipt_number()
+
+    order_id = str(body.id).strip() if (getattr(body, "id", None) and str(body.id).strip()) else new_id()
     ts = iso(now_utc())
     order = {
-        "id": new_id(),
+        "id": order_id,
         "receipt_no": rn,
         "items": items,
         "subtotal": totals["subtotal"],
@@ -1590,6 +1703,20 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
         "token_no": body.token_no,
         "order_type": order_type,
     }
+
+    # Deduplication: Check if order already exists by id or receipt_no
+    existing = await _fetchone(db, "SELECT id FROM orders WHERE (id = ? OR receipt_no = ?) AND tenant_db = ?", (order_id, rn, tenant))
+    if existing:
+        await _execute(db,
+            """UPDATE orders SET items = ?, subtotal = ?, tax = ?, discount = ?, total = ?,
+               payment_mode = ?, notes = ?, token_no = ?, order_type = ?, customer_name = ?, customer_phone = ?
+               WHERE id = ? AND tenant_db = ?""",
+            (_to_json(order["items"]), order["subtotal"], order["tax"], order["discount"], order["total"],
+             order["payment_mode"], order["notes"], order["token_no"], order["order_type"],
+             order["customer_name"], order["customer_phone"], existing["id"], tenant))
+        order["id"] = existing["id"]
+        return order
+
     await _execute(db,
         """INSERT INTO orders (id, tenant_db, receipt_no, items, subtotal, tax, discount, total, payment_mode, notes,
            created_at, paid_at, cashier_email, cashier_name, token_no, order_type)
@@ -1689,10 +1816,31 @@ async def list_orders(
     rows = await _fetchall(db,
         f"SELECT * FROM orders WHERE {where} ORDER BY paid_at DESC LIMIT ?", params)
     
+    seen_receipt_nos = set()
+    cleaned_rows = []
     for r in rows:
         r["items"] = _parse_json(r.get("items"), [])
         r.pop("tenant_db", None)
-    return rows
+        rn = r.get("receipt_no")
+        if rn is not None:
+            try:
+                rn_int = int(rn)
+                if 1001 <= rn_int < 2000:
+                    rn_int = rn_int - 1000
+                r["receipt_no"] = rn_int
+                r["bill_number"] = rn_int
+            except (ValueError, TypeError):
+                pass
+        
+        # Deduplicate: if an order with this canonical receipt_no was already seen, skip the duplicate
+        cur_rn = r.get("receipt_no")
+        if cur_rn is not None and cur_rn in seen_receipt_nos:
+            continue
+        if cur_rn is not None:
+            seen_receipt_nos.add(cur_rn)
+        cleaned_rows.append(r)
+
+    return cleaned_rows
 
 
 @api.get("/orders/{oid}")
@@ -1730,13 +1878,25 @@ async def delete_order(oid: str, user: dict = Depends(get_current_user)):
         return await reset_orders_reset_path(user)
     db = await get_db()
     tenant = _tenant()
-    order = await _fetchone(db, "SELECT id FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    order = await _fetchone(db, "SELECT id, receipt_no FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
     if not order:
         raise HTTPException(404, "Order not found")
+    
+    del_rn = order.get("receipt_no")
     await _execute(db, "DELETE FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    
+    # Resequence: Shift subsequent orders down by 1 so bill numbers remain continuous
+    if del_rn is not None and int(del_rn) > 0:
+        await _execute(db, "UPDATE orders SET receipt_no = receipt_no - 1 WHERE tenant_db = ? AND receipt_no > ?", (tenant, int(del_rn)))
+
     remaining = await _fetchone(db, "SELECT COUNT(*) as count FROM orders WHERE tenant_db = ?", (tenant,))
     if remaining and remaining["count"] == 0:
         await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
+    else:
+        max_rn_row = await _fetchone(db, "SELECT MAX(receipt_no) as max_rn FROM orders WHERE tenant_db = ?", (tenant,))
+        new_max = int(max_rn_row["max_rn"]) if max_rn_row and max_rn_row["max_rn"] is not None else 0
+        if new_max > 0:
+            await _execute(db, "UPDATE counters SET value = ? WHERE id = 'receipt' AND tenant_db = ?", (new_max, tenant))
     return {"ok": True, "id": oid}
 
 
@@ -1933,11 +2093,19 @@ async def export_report(
     if rtype == "sales":
         headers = ["Receipt #", "Date", "Items", "Subtotal", "CGST", "SGST", "Total Tax", "Discount", "Total", "Payment", "Cashier"]
         rows = []
+        tot_cash = 0.0
+        tot_upi = 0.0
+        tot_card = 0.0
         for o in orders:
             items_txt = "; ".join(f"{i['name']} x{i['qty']}" for i in o.get("items", []))
             tax_val = float(o.get("tax", 0))
             cgst_val = float(o.get("cgst", round(tax_val / 2.0, 2)))
             sgst_val = float(o.get("sgst", round(tax_val - cgst_val, 2)))
+            tot_val = float(o.get("total", 0))
+            pmode = str(o.get("payment_mode", "")).lower()
+            if pmode == "cash": tot_cash += tot_val
+            elif pmode == "upi": tot_upi += tot_val
+            elif pmode == "card": tot_card += tot_val
             rows.append([
                 o.get("receipt_no", ""),
                 o.get("paid_at", ""),
@@ -1947,18 +2115,60 @@ async def export_report(
                 sgst_val,
                 tax_val,
                 o.get("discount", 0),
-                o.get("total", 0),
+                tot_val,
                 o.get("payment_mode", ""),
                 o.get("cashier_name", ""),
             ])
+        if rows:
+            order_count = len(rows)
+            tot_subtotal = sum(float(r[3] or 0) for r in rows)
+            tot_cgst = sum(float(r[4] or 0) for r in rows)
+            tot_sgst = sum(float(r[5] or 0) for r in rows)
+            tot_tax = sum(float(r[6] or 0) for r in rows)
+            tot_discount = sum(float(r[7] or 0) for r in rows)
+            tot_total = sum(float(r[8] or 0) for r in rows)
+            rows.append([
+                "TOTAL :",
+                f"{order_count} Orders",
+                "—",
+                round(tot_subtotal, 2),
+                round(tot_cgst, 2),
+                round(tot_sgst, 2),
+                round(tot_tax, 2),
+                round(tot_discount, 2),
+                round(tot_total, 2),
+                "—",
+                "—"
+            ])
+            rows.append([])
+            rows.append(["--- AGGREGATE TOTALS SUMMARY ---", "", "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total Number of Orders/Bills", order_count, "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total Subtotal (Taxable Amount)", round(tot_subtotal, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total CGST Collected", round(tot_cgst, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total SGST Collected", round(tot_sgst, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total Tax Collected", round(tot_tax, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total Amount Collected (Gross Sales)", round(tot_total, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append([])
+            rows.append(["--- PAYMENT MODE BREAKDOWN ---", "", "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total Cash Collected", round(tot_cash, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total UPI Collected", round(tot_upi, 2), "", "", "", "", "", "", "", "", ""])
+            rows.append(["Total Card Collected", round(tot_card, 2), "", "", "", "", "", "", "", "", ""])
     elif rtype == "products":
         agg = _agg_top_items(orders, only_thali=False, top=1000)
         headers = ["Product", "Qty Sold", "Revenue (Rs)"]
         rows = [[a["name"], a["qty"], a["revenue"]] for a in agg]
+        if rows:
+            tot_qty = sum(int(r[1] or 0) for r in rows)
+            tot_rev = sum(float(r[2] or 0) for r in rows)
+            rows.append([f"TOTAL : ({len(rows)} Items)", tot_qty, round(tot_rev, 2)])
     else:  # thalis
         agg = _agg_top_items(orders, only_thali=True, top=1000)
         headers = ["Thali", "Qty Sold", "Revenue (Rs)"]
         rows = [[a["name"], a["qty"], a["revenue"]] for a in agg]
+        if rows:
+            tot_qty = sum(int(r[1] or 0) for r in rows)
+            tot_rev = sum(float(r[2] or 0) for r in rows)
+            rows.append([f"TOTAL : ({len(rows)} Thalis)", tot_qty, round(tot_rev, 2)])
 
     fname = f"{rtype}_{(from_date or 'all')[:10]}_{(to_date or 'now')[:10]}.{fmt}"
     if fmt == "xlsx":

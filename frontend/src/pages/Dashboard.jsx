@@ -4,6 +4,8 @@ import { Card } from "../components/ui/card";
 import { TrendingUp, ShoppingBag, IndianRupee, Banknote, Smartphone, CreditCard, Sparkles } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Tooltip, BarChart, Bar, Cell } from "recharts";
 import { useLanguage } from "../context/LanguageContext";
+import { offlineStorage } from "../lib/offlineStorage";
+import { safeNumber } from "../lib/utils";
 
 const PAY_COLORS = { cash: "#78A61A", upi: "#FF7A2F", card: "#4F8EF7" };
 const PAY_ICONS = { cash: Banknote, upi: Smartphone, card: CreditCard };
@@ -32,12 +34,132 @@ export default function Dashboard() {
     { key: "month", label: t("this_month") },
   ], [t]);
 
+  const computeLocalSummary = useMemo(() => () => {
+    try {
+      const orders = offlineStorage.getOrders();
+      const now = new Date();
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+      const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6).toISOString();
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+      const getOrdersInRange = (startIso) => {
+        return orders.filter((o) => {
+          const raw = o.paid_at || o.createdAt || o.created_at;
+          return raw && new Date(raw).toISOString() >= startIso;
+        });
+      };
+
+      const kpi = (list) => {
+        const total = list.reduce((s, o) => s + safeNumber(o.grandTotal !== undefined ? o.grandTotal : o.total), 0);
+        const count = list.length;
+        return {
+          revenue: Math.round(total * 100) / 100,
+          orders: count,
+          avg: count ? Math.round((total / count) * 100) / 100 : 0,
+        };
+      };
+
+      const getTopItems = (list, onlyThali = false) => {
+        const map = new Map();
+        list.forEach((o) => {
+          const items = Array.isArray(o.items) ? o.items : [];
+          items.forEach((it) => {
+            const isThali = Boolean(it.is_thali || it.category === "THALI" || (it.name && it.name.toLowerCase().includes("thali")));
+            if ((onlyThali && isThali) || (!onlyThali && !isThali)) {
+              const name = it.name || "Item";
+              const qty = safeNumber(it.quantity || it.qty, 1);
+              const price = safeNumber(it.price, 0);
+              const total = safeNumber(it.revenue !== undefined ? it.revenue : (it.total !== undefined ? it.total : price * qty));
+              if (!map.has(name)) map.set(name, { name, count: 0, revenue: 0 });
+              const c = map.get(name);
+              c.count += qty;
+              c.revenue += total;
+            }
+          });
+        });
+        return Array.from(map.values()).sort((a, b) => b.revenue - a.revenue).slice(0, 10);
+      };
+
+      const getPaymentBreakdown = (list) => {
+        const pay = { cash: 0, upi: 0, card: 0 };
+        list.forEach((o) => {
+          const m = (o.paymentMethod || o.payment_mode || "cash").toLowerCase();
+          const amt = safeNumber(o.grandTotal !== undefined ? o.grandTotal : o.total);
+          if (m === "upi") pay.upi += amt;
+          else if (m === "card") pay.card += amt;
+          else pay.cash += amt;
+        });
+        return pay;
+      };
+
+      const todayOrders = getOrdersInRange(todayStart);
+      const weekOrders = getOrdersInRange(weekStart);
+      const monthOrders = getOrdersInRange(monthStart);
+
+      const series = [];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+        const dStr = d.toISOString().slice(0, 10);
+        const dayOrders = orders.filter((o) => {
+          const raw = o.paid_at || o.createdAt || o.created_at;
+          return raw && new Date(raw).toISOString().slice(0, 10) === dStr;
+        });
+        series.push({
+          date: dStr,
+          revenue: Math.round(dayOrders.reduce((s, o) => s + safeNumber(o.grandTotal !== undefined ? o.grandTotal : o.total), 0) * 100) / 100,
+          orders: dayOrders.length,
+        });
+      }
+
+      return {
+        today: kpi(todayOrders),
+        week: kpi(weekOrders),
+        month: kpi(monthOrders),
+        series: series,
+        top_items_today: getTopItems(todayOrders, false),
+        top_items_week: getTopItems(weekOrders, false),
+        top_items_month: getTopItems(monthOrders, false),
+        top_thalis_today: getTopItems(todayOrders, true),
+        top_thalis_week: getTopItems(weekOrders, true),
+        top_thalis_month: getTopItems(monthOrders, true),
+        payment_today: getPaymentBreakdown(todayOrders),
+        payment_week: getPaymentBreakdown(weekOrders),
+        payment_month: getPaymentBreakdown(monthOrders),
+      };
+    } catch (e) {
+      console.warn("Local summary calculation failed:", e);
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
-    const fetchSummary = () => api.get("/dashboard/summary").then((r) => setData(r.data)).catch(console.error);
+    const fetchSummary = async () => {
+      try {
+        const r = await api.get("/dashboard/summary");
+        setData(r.data);
+      } catch (err) {
+        console.warn("Server summary unreachable, computing local dashboard metrics:", err);
+        const localData = computeLocalSummary();
+        if (localData) setData(localData);
+      }
+    };
+
     fetchSummary();
     const t = setInterval(fetchSummary, 20000);
-    return () => clearInterval(t);
-  }, []);
+
+    const handleOrdersChange = () => {
+      fetchSummary();
+    };
+
+    window.addEventListener("ordersUpdated", handleOrdersChange);
+    window.addEventListener("pos_orders_changed", handleOrdersChange);
+
+    return () => {
+      clearInterval(t);
+      window.removeEventListener("ordersUpdated", handleOrdersChange);
+      window.removeEventListener("pos_orders_changed", handleOrdersChange);
+    };
+  }, [computeLocalSummary]);
 
   if (!data) return <div className="p-10 text-muted-foreground">Loading…</div>;
 

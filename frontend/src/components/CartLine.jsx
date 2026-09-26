@@ -1,6 +1,7 @@
 import React, { useMemo } from "react";
 import { Plus, Minus, Trash2, Sparkles } from "lucide-react";
 import { useLanguage } from "../context/LanguageContext";
+import { safeNumber, safeFixed } from "../lib/utils";
 
 function translateExtras(extrasStr, t) {
   if (!extrasStr) return "";
@@ -64,22 +65,22 @@ function CartLineComponent({ line, onInc, onDec, onRemove, onEditThali }) {
 
           {line.extra_bread > 0 && (
             <div className="text-[11px] text-amber-800 mt-1 font-medium bg-amber-50 border border-amber-200/60 px-2 py-0.5 rounded-md inline-block">
-              🍞 {t("Extra Roti")} ({line.extra_bread}) · ₹{line.extra_bread_charge.toFixed(2)}
+              🍞 {t("Extra Roti")} ({line.extra_bread}) · ₹{safeFixed(line.extra_bread_charge)}
             </div>
           )}
 
           <div className="text-xs text-slate-500 font-mono mt-1.5 flex flex-wrap items-center gap-1">
             <span className="font-semibold text-slate-700">₹{line.price}</span>
             <span>× {line.qty} =</span>
-            <span className="font-bold text-[#FF6B00]">₹{(line.price * line.qty).toFixed(2)}</span>
-            {line.extra_bread_charge > 0 && (
-              <span className="text-amber-700 font-medium">+ ₹{line.extra_bread_charge.toFixed(2)}</span>
+            <span className="font-bold text-[#FF6B00]">₹{safeFixed(safeNumber(line.price) * safeNumber(line.qty))}</span>
+            {safeNumber(line.extra_bread_charge) > 0 && (
+              <span className="text-amber-700 font-medium">+ ₹{safeFixed(line.extra_bread_charge)}</span>
             )}
           </div>
 
           {line.current_stock !== undefined && line.current_stock !== null && (
             <div className="text-[10px] text-emerald-700 font-semibold mt-1">
-              Stock: {line.current_stock % 1 !== 0 ? line.current_stock.toFixed(3) + " kg" : line.current_stock}
+              Stock: {line.current_stock % 1 !== 0 ? safeFixed(line.current_stock, 3) + " kg" : line.current_stock}
             </div>
           )}
         </div>
