@@ -29,6 +29,8 @@ jobs:
 
       - name: Build React App
         working-directory: frontend
+        env:
+          CI: false
         run: npm run build
 
       - name: Set up JDK 21
