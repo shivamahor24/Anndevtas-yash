@@ -51,8 +51,22 @@ import { safeNumber, safeFixed } from "../lib/utils";
 
 
 export default function Billing() {
-  const [categories, setCategories] = useState([]);
-  const [menu, setMenu] = useState([]);
+  const [categories, setCategories] = useState(() => {
+    try {
+      const cached = offlineStorage.loadCategories();
+      return Array.isArray(cached) && cached.length > 0 ? cached : [];
+    } catch {
+      return [];
+    }
+  });
+  const [menu, setMenu] = useState(() => {
+    try {
+      const cached = offlineStorage.loadMenu();
+      return Array.isArray(cached) && cached.length > 0 ? cached : [];
+    } catch {
+      return [];
+    }
+  });
   const [settings, setSettings] = useState(null);
   const [activeCat, setActiveCat] = useState("ALL ITEMS");
   const [search, setSearch] = useState("");
@@ -121,7 +135,7 @@ export default function Billing() {
           is_thali: isThali,
           menuType,
           menu_type: menuType,
-          available: m.available !== false,
+          available: m.available !== false && m.available !== 0 && m.available !== "0" && m.available !== "false",
         });
       });
     }
@@ -489,6 +503,10 @@ export default function Billing() {
       console.log("Loaded clean default POS data or offline.");
       const cached = offlineStorage.loadSettings();
       if (cached) setSettings(cached);
+      const cachedMenu = offlineStorage.loadMenu();
+      if (Array.isArray(cachedMenu) && cachedMenu.length > 0) setMenu(cachedMenu);
+      const cachedCats = offlineStorage.loadCategories();
+      if (Array.isArray(cachedCats) && cachedCats.length > 0) setCategories(cachedCats);
     }
   }, [changeLanguage]);
 
@@ -537,7 +555,8 @@ export default function Billing() {
         item.name.toLowerCase().includes(q) ||
         (item.category_name && item.category_name.toLowerCase().includes(q));
 
-      return matchCat && matchSearch && item.available !== false;
+      const isAvail = item.available !== false && item.available !== 0 && item.available !== "0" && item.available !== "false";
+      return matchCat && matchSearch && isAvail;
     });
   }, [search, activeCat]);
 
@@ -900,8 +919,22 @@ export default function Billing() {
               </div>
 
               {filteredDining.length === 0 ? (
-                <div className="text-center py-10 text-slate-400 border border-dashed border-[#EFE5DA] rounded-2xl bg-white/60 text-sm">
-                  No Dining items match "{search || activeCat}"
+                <div className="text-center py-10 text-slate-500 border border-dashed border-[#EFE5DA] rounded-2xl bg-white/60 text-sm flex flex-col items-center gap-3">
+                  <p>No Dining items match "{search || activeCat}" or items are marked inactive.</p>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await api.post("/menu/enable-all");
+                        refresh();
+                        toast.success("All menu items enabled!");
+                      } catch (err) {
+                        toast.error("Failed to enable menu items");
+                      }
+                    }}
+                    className="px-4 py-2 bg-[#FF6B00] text-white text-xs font-bold rounded-xl shadow-xs hover:bg-[#e05e00] transition-colors cursor-pointer"
+                  >
+                    Enable All Items
+                  </button>
                 </div>
               ) : (
                 <div
@@ -940,8 +973,22 @@ export default function Billing() {
               </div>
 
               {filteredParcel.length === 0 ? (
-                <div className="text-center py-10 text-slate-400 border border-dashed border-[#EFE5DA] rounded-2xl bg-white/60 text-sm">
-                  No Parcel items match "{search || activeCat}"
+                <div className="text-center py-10 text-slate-500 border border-dashed border-[#EFE5DA] rounded-2xl bg-white/60 text-sm flex flex-col items-center gap-3">
+                  <p>No Parcel items match "{search || activeCat}" or items are marked inactive.</p>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await api.post("/menu/enable-all");
+                        refresh();
+                        toast.success("All menu items enabled!");
+                      } catch (err) {
+                        toast.error("Failed to enable menu items");
+                      }
+                    }}
+                    className="px-4 py-2 bg-[#FF6B00] text-white text-xs font-bold rounded-xl shadow-xs hover:bg-[#e05e00] transition-colors cursor-pointer"
+                  >
+                    Enable All Items
+                  </button>
                 </div>
               ) : (
                 <div

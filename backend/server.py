@@ -240,7 +240,7 @@ class MenuItemIn(BaseModel):
     name: str
     category_id: str
     price: float
-    available: bool = False
+    available: bool = True
     is_thali: bool = False
     thali_groups: List[ThaliGroup] = Field(default_factory=list)
     thali_extras: str = ""
@@ -1431,6 +1431,14 @@ async def reset_menu_availability(_: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
+@api.post("/menu/enable-all")
+async def enable_all_menu(_: dict = Depends(get_current_user)):
+    db = await get_db()
+    tenant = _tenant()
+    await _execute(db, "UPDATE menu SET available = 1 WHERE tenant_db = ?", (tenant,))
+    return {"ok": True}
+
+
 @api.post("/menu/bulk-import")
 async def bulk_import_menu(body: BulkImportIn, _: dict = Depends(require_roles("admin"))):
     db = await get_db()
@@ -1704,8 +1712,8 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
         "order_type": order_type,
     }
 
-    # Deduplication: Check if order already exists by id or receipt_no
-    existing = await _fetchone(db, "SELECT id FROM orders WHERE (id = ? OR receipt_no = ?) AND tenant_db = ?", (order_id, rn, tenant))
+    # Deduplication: Check if order already exists by id
+    existing = await _fetchone(db, "SELECT id FROM orders WHERE id = ? AND tenant_db = ?", (order_id, tenant))
     if existing:
         await _execute(db,
             """UPDATE orders SET items = ?, subtotal = ?, tax = ?, discount = ?, total = ?,
@@ -1816,11 +1824,15 @@ async def list_orders(
     rows = await _fetchall(db,
         f"SELECT * FROM orders WHERE {where} ORDER BY paid_at DESC LIMIT ?", params)
     
-    seen_receipt_nos = set()
+    seen_ids = set()
     cleaned_rows = []
     for r in rows:
         r["items"] = _parse_json(r.get("items"), [])
         r.pop("tenant_db", None)
+        oid = r.get("id")
+        if oid in seen_ids:
+            continue
+        seen_ids.add(oid)
         rn = r.get("receipt_no")
         if rn is not None:
             try:
@@ -1831,13 +1843,6 @@ async def list_orders(
                 r["bill_number"] = rn_int
             except (ValueError, TypeError):
                 pass
-        
-        # Deduplicate: if an order with this canonical receipt_no was already seen, skip the duplicate
-        cur_rn = r.get("receipt_no")
-        if cur_rn is not None and cur_rn in seen_receipt_nos:
-            continue
-        if cur_rn is not None:
-            seen_receipt_nos.add(cur_rn)
         cleaned_rows.append(r)
 
     return cleaned_rows
@@ -1918,26 +1923,49 @@ async def _orders_in_range(start_iso: str, end_iso: str) -> list:
     db = await get_db()
     tenant = _tenant()
     rows = await _fetchall(db,
-        "SELECT * FROM orders WHERE tenant_db = ? AND paid_at >= ? AND paid_at <= ?",
-        (tenant, start_iso, end_iso))
+        "SELECT * FROM orders WHERE tenant_db = ? ORDER BY paid_at ASC",
+        (tenant,))
+    s_day = (start_iso or "")[:10]
+    e_day = (end_iso or "")[:10]
+    filtered = []
     for r in rows:
         r["items"] = _parse_json(r.get("items"), [])
         r.pop("tenant_db", None)
-    return rows
+        pa = str(r.get("paid_at") or "")
+        d_str = pa[:10]
+        if s_day and e_day:
+            if s_day <= d_str <= e_day:
+                filtered.append(r)
+        elif s_day:
+            if d_str >= s_day:
+                filtered.append(r)
+        elif e_day:
+            if d_str <= e_day:
+                filtered.append(r)
+        else:
+            filtered.append(r)
+    return filtered
 
 
 def _agg_top_items(orders: list, only_thali: bool = False, top: int = 5) -> list:
     counter: Dict[str, int] = {}
     rev: Dict[str, float] = {}
+    rates: Dict[str, float] = {}
     for o in orders:
         for it in o.get("items", []):
             if only_thali and not it.get("is_thali"): continue
             if (not only_thali) and it.get("is_thali"): continue
-            name = it["name"]
-            counter[name] = counter.get(name, 0) + it["qty"]
-            rev[name] = rev.get(name, 0.0) + (it["price"] * it["qty"])
+            name = it.get("name", "Item")
+            qty = int(it.get("qty", it.get("quantity", 1)) or 1)
+            price = float(it.get("price", 0.0) or 0.0)
+            eb_charge = float(it.get("extra_bread_charge", 0.0) or 0.0)
+            unit_price = price + eb_charge
+            counter[name] = counter.get(name, 0) + qty
+            rev[name] = rev.get(name, 0.0) + (unit_price * qty)
+            if unit_price > 0:
+                rates[name] = unit_price
     out = sorted(counter.items(), key=lambda x: -x[1])[:top]
-    return [{"name": n, "qty": q, "revenue": round(rev[n], 2)} for n, q in out]
+    return [{"name": n, "rate": rates.get(n, round(rev[n] / q, 2) if q else 0.0), "qty": q, "revenue": round(rev[n], 2)} for n, q in out]
 
 
 def _agg_payment_breakdown(orders: list) -> dict:
@@ -2155,20 +2183,20 @@ async def export_report(
             rows.append(["Total Card Collected", round(tot_card, 2), "", "", "", "", "", "", "", "", ""])
     elif rtype == "products":
         agg = _agg_top_items(orders, only_thali=False, top=1000)
-        headers = ["Product", "Qty Sold", "Revenue (Rs)"]
-        rows = [[a["name"], a["qty"], a["revenue"]] for a in agg]
+        headers = ["Sr", "Product", "Rate (Rs)", "Qty Sold", "Revenue (Rs)"]
+        rows = [[i + 1, a["name"], a.get("rate", 0.0), a["qty"], a["revenue"]] for i, a in enumerate(agg)]
         if rows:
-            tot_qty = sum(int(r[1] or 0) for r in rows)
-            tot_rev = sum(float(r[2] or 0) for r in rows)
-            rows.append([f"TOTAL : ({len(rows)} Items)", tot_qty, round(tot_rev, 2)])
+            tot_qty = sum(int(r[3] or 0) for r in rows)
+            tot_rev = sum(float(r[4] or 0) for r in rows)
+            rows.append(["TOTAL :", f"{len(rows)} Items", "", tot_qty, round(tot_rev, 2)])
     else:  # thalis
         agg = _agg_top_items(orders, only_thali=True, top=1000)
-        headers = ["Thali", "Qty Sold", "Revenue (Rs)"]
-        rows = [[a["name"], a["qty"], a["revenue"]] for a in agg]
+        headers = ["Sr", "Thali", "Rate (Rs)", "Qty Sold", "Revenue (Rs)"]
+        rows = [[i + 1, a["name"], a.get("rate", 0.0), a["qty"], a["revenue"]] for i, a in enumerate(agg)]
         if rows:
-            tot_qty = sum(int(r[1] or 0) for r in rows)
-            tot_rev = sum(float(r[2] or 0) for r in rows)
-            rows.append([f"TOTAL : ({len(rows)} Thalis)", tot_qty, round(tot_rev, 2)])
+            tot_qty = sum(int(r[3] or 0) for r in rows)
+            tot_rev = sum(float(r[4] or 0) for r in rows)
+            rows.append(["TOTAL :", f"{len(rows)} Thalis", "", tot_qty, round(tot_rev, 2)])
 
     fname = f"{rtype}_{(from_date or 'all')[:10]}_{(to_date or 'now')[:10]}.{fmt}"
     if fmt == "xlsx":

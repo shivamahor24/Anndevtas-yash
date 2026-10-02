@@ -319,7 +319,7 @@ export default function MenuPage() {
       name: "",
       category_id: categories[0]?.id || "",
       price: 0,
-      available: false,
+      available: true,
       is_thali: false,
       thali_groups: [],
       thali_extras: "",

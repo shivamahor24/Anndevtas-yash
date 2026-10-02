@@ -65,6 +65,17 @@ export default function OrderHistory() {
 
   const getLocalDateString = (rawDate) => {
     if (!rawDate) return "";
+    if (typeof rawDate === "string") {
+      const trimmed = rawDate.trim();
+      const dmy = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+      if (dmy) {
+        return `${dmy[3]}-${String(dmy[2]).padStart(2, '0')}-${String(dmy[1]).padStart(2, '0')}`;
+      }
+      const ymd = trimmed.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+      if (ymd && !trimmed.includes("T")) {
+        return `${ymd[1]}-${String(ymd[2]).padStart(2, '0')}-${String(ymd[3]).padStart(2, '0')}`;
+      }
+    }
     const d = new Date(rawDate);
     if (isNaN(d.getTime())) return "";
     const year = d.getFullYear();
@@ -116,19 +127,38 @@ export default function OrderHistory() {
   };
 
   const handleSearchDate = () => {
+    setActiveFilter("all");
     setAppliedSearchDate(searchDate);
     setCurrentPage(1);
   };
 
-  const fetchOrders = useCallback(() => {
+  const fetchOrders = useCallback(async () => {
     setError(null);
+    setLoading(true);
     try {
+      // 1. Instant zero-latency load from offline storage
       const localOrders = offlineStorage.getOrders();
       setOrders(localOrders);
-      setLoading(false);
+
+      // 2. Fetch server-side orders to ensure full history across all dates
+      try {
+        const res = await api.get("/orders");
+        if (Array.isArray(res.data) && res.data.length > 0) {
+          res.data.forEach((serverOrder) => {
+            try {
+              offlineStorage.saveOrder(serverOrder);
+            } catch (_) {}
+          });
+          const fresh = offlineStorage.getOrders();
+          setOrders(fresh);
+        }
+      } catch (apiErr) {
+        console.log("Server sync optional / offline:", apiErr.message);
+      }
     } catch (err) {
       console.error("Failed to load order history from storage:", err);
       setError(err.message || "Unable to load order history");
+    } finally {
       setLoading(false);
     }
   }, []);
@@ -177,14 +207,17 @@ export default function OrderHistory() {
     if (!Array.isArray(orders)) return [];
     let list = orders;
 
-    // Search query filter (Order number, customer name, etc.)
+    // Search query filter (Order number, customer name, phone, item name, or date substring)
     if (q) {
       const query = q.trim().toLowerCase();
       list = list.filter((o) => {
         const oNum = String(o.billNumber || o.orderNumber || o.receipt_no || "");
         const cName = String(o.customerName || o.customer_name || "").toLowerCase();
         const cPhone = String(o.customerPhone || o.customer_phone || "");
-        return oNum.includes(query) || cName.includes(query) || cPhone.includes(query);
+        const rawDate = o.paid_at || o.createdAt || o.created_at || o.date || "";
+        const dStr = getLocalDateString(rawDate);
+        const itemMatch = Array.isArray(o.items) && o.items.some(it => String(it.name || "").toLowerCase().includes(query));
+        return oNum.includes(query) || cName.includes(query) || cPhone.includes(query) || dStr.includes(query) || itemMatch;
       });
     }
 
@@ -208,7 +241,7 @@ export default function OrderHistory() {
       });
     }
 
-    if (activeFilter === "all") return list;
+    if (activeFilter === "all" || appliedSearchDate || (from && to)) return list;
 
     const todayStr = getLocalDateString(new Date());
 
@@ -508,14 +541,25 @@ export default function OrderHistory() {
                       </td>
 
                       {/* Items */}
-                      <td className="px-3 py-2.5 max-w-[180px] md:max-w-[240px]">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[9.5px] font-bold uppercase tracking-wider bg-slate-100 text-slate-700 px-1.5 py-0.5 rounded shrink-0">
-                            {totalItemsCount} {totalItemsCount === 1 ? "Item" : "Items"}
-                          </span>
-                          <span className="text-[11px] md:text-xs text-slate-600 truncate" title={itemsSummary}>
-                            {itemsSummary}
-                          </span>
+                      <td className="px-3 py-2.5 min-w-[200px] max-w-[340px]">
+                        <div className="flex flex-col gap-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9.5px] font-bold uppercase tracking-wider bg-orange-50 border border-orange-200 text-[#FF6B00] px-1.5 py-0.5 rounded shrink-0">
+                              {totalItemsCount} {totalItemsCount === 1 ? "Item" : "Items"}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {orderItems.map((i, idx) => (
+                              <span
+                                key={idx}
+                                className="inline-flex items-center gap-1 text-[11px] bg-slate-100 text-slate-800 px-2 py-0.5 rounded-md font-medium border border-slate-200/60 shadow-2xs"
+                                title={i.name}
+                              >
+                                <span className="truncate max-w-[140px]">{t(i.name)}</span>
+                                <span className="font-bold text-[#FF6B00]">×{i.quantity || i.qty || 1}</span>
+                              </span>
+                            ))}
+                          </div>
                         </div>
                       </td>
 
@@ -718,10 +762,45 @@ export default function OrderHistory() {
       {/* View Order Dialog */}
       {view && (
         <Dialog open={true} onOpenChange={(o) => !o && setView(null)}>
-          <DialogContent className="w-[92vw] max-w-md max-h-[90vh] overflow-y-auto flex flex-col items-center bg-neutral-50 p-4 sm:p-6 border border-border rounded-[24px]">
-            <DialogHeader className="w-full text-center mb-1">
-              <DialogTitle className="font-display text-base md:text-lg text-neutral-700">{t("order_details") || "Order Details"}</DialogTitle>
+          <DialogContent className="w-[92vw] max-w-lg max-h-[90vh] overflow-y-auto flex flex-col bg-neutral-50 p-4 sm:p-6 border border-border rounded-[24px]">
+            <DialogHeader className="w-full text-center mb-2">
+              <DialogTitle className="font-display text-base md:text-lg text-neutral-800">
+                {t("order_details") || "Order Details"} — Bill #{view.billNumber || view.orderNumber || view.receipt_no}
+              </DialogTitle>
             </DialogHeader>
+
+            {/* Complete Itemized Breakdown */}
+            <div className="w-full bg-white rounded-xl p-3 border border-[#F4E6D7] mb-3 shadow-2xs text-xs space-y-2">
+              <div className="font-bold text-slate-800 uppercase tracking-wider text-[11px] border-b pb-1.5 flex justify-between">
+                <span>All Items in this Order ({Array.isArray(view.items) ? view.items.length : 0})</span>
+                <span className="text-slate-500 font-normal">
+                  {view.paid_at || view.createdAt || view.created_at ? new Date(view.paid_at || view.createdAt || view.created_at).toLocaleDateString('en-IN') : ""}
+                </span>
+              </div>
+              <div className="divide-y divide-slate-100 max-h-48 overflow-y-auto pr-1">
+                {Array.isArray(view.items) && view.items.map((it, idx) => (
+                  <div key={idx} className="py-1.5 flex justify-between items-start gap-2">
+                    <div className="min-w-0">
+                      <div className="font-semibold text-slate-800 text-[12px]">{t(it.name)}</div>
+                      {it.thali_selections && (
+                        <div className="text-[10px] text-slate-500 mt-0.5">
+                          {typeof it.thali_selections === 'string' ? it.thali_selections : Object.values(it.thali_selections).flat().join(', ')}
+                        </div>
+                      )}
+                    </div>
+                    <div className="text-right whitespace-nowrap">
+                      <span className="font-bold text-[#FF6B00]">×{it.quantity || it.qty || 1}</span>
+                      <span className="text-slate-500 ml-2 font-mono">₹{safeFixed(it.price * (it.quantity || it.qty || 1))}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="border-t pt-2 flex justify-between font-bold text-slate-900 text-sm">
+                <span>Grand Total</span>
+                <span className="text-[#FF6B00] font-mono">₹{safeFixed(view.grandTotal || view.total)}</span>
+              </div>
+            </div>
+
             <div className="flex justify-center w-full">
               <ReceiptPreview order={view} settings={settings} />
             </div>

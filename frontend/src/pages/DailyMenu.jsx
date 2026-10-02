@@ -34,18 +34,7 @@ export default function DailyMenu() {
   };
 
   useEffect(() => {
-    const init = async () => {
-      if (!sessionStorage.getItem("menu_session_reset")) {
-        try {
-          await api.post("/menu/reset");
-          sessionStorage.setItem("menu_session_reset", "true");
-        } catch (e) {
-          console.error("Session menu reset failed:", e);
-        }
-      }
-      refresh();
-    };
-    init();
+    refresh();
   }, []);
 
   const safeMenu = safeArray(menu);

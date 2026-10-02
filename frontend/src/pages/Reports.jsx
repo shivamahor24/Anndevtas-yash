@@ -1,13 +1,26 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState, useMemo } from "react";
 import api, { API, tokenStore } from "../lib/api";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
-import { Download, FileSpreadsheet, FileText, BarChart3, Sparkles, ShoppingBag } from "lucide-react";
+import {
+  FileSpreadsheet,
+  FileText,
+  BarChart3,
+  Sparkles,
+  ShoppingBag,
+  ChevronDown,
+  ChevronRight,
+  Printer,
+  Calendar,
+  Layers,
+  List
+} from "lucide-react";
 import { toast } from "sonner";
 import { useLanguage } from "../context/LanguageContext";
-import { safeArray } from "../lib/safeArray";
-import { offlineStorage, getOrders } from "../lib/offlineStorage";
+import { offlineStorage, canonicalBillNumber } from "../lib/offlineStorage";
+import { safeNumber, safeFixed } from "../lib/utils";
+import * as XLSX from "xlsx";
 
 const REPORT_TABS = [
   { key: "sales", label: "Daily Sales", icon: ShoppingBag },
@@ -16,53 +29,135 @@ const REPORT_TABS = [
 ];
 
 const PERIODS = [
-  { key: "today", label: "Today", days: 0 },
-  { key: "week", label: "Last 7 days", days: 7 },
-  { key: "month", label: "Last 30 days", days: 30 },
-  { key: "custom", label: "Custom" },
+  { key: "today", label: "Today" },
+  { key: "week", label: "Last 7 days" },
+  { key: "month", label: "Last 30 days" },
+  { key: "custom", label: "Custom Range" },
 ];
 
-const toIso = (dt, endOfDay = false) => {
-  const d = new Date(dt);
-  if (endOfDay) d.setHours(23, 59, 59, 999); else d.setHours(0, 0, 0, 0);
-  return d.toISOString();
+const getLocalDateString = (rawDate) => {
+  if (!rawDate) return "";
+  if (typeof rawDate === "string") {
+    const trimmed = rawDate.trim();
+    const dmy = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+    if (dmy) {
+      return `${dmy[3]}-${String(dmy[2]).padStart(2, '0')}-${String(dmy[1]).padStart(2, '0')}`;
+    }
+    const ymd = trimmed.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+    if (ymd && !trimmed.includes("T")) {
+      return `${ymd[1]}-${String(ymd[2]).padStart(2, '0')}-${String(ymd[3]).padStart(2, '0')}`;
+    }
+  }
+  const d = new Date(rawDate);
+  if (isNaN(d.getTime())) return "";
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 };
 
-import { safeNumber, safeFixed } from "../lib/utils";
-import * as XLSX from "xlsx";
+const formatDisplayDate = (dStr) => {
+  if (!dStr) return "";
+  const parts = dStr.split("-");
+  if (parts.length === 3) {
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+  }
+  return dStr;
+};
+
+const getPresetRange = (key) => {
+  const now = new Date();
+  const todayStr = getLocalDateString(now);
+  if (key === "today") {
+    return { fromStr: todayStr, toStr: todayStr };
+  }
+  if (key === "week") {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
+    return { fromStr: getLocalDateString(d), toStr: todayStr };
+  }
+  if (key === "month") {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29);
+    return { fromStr: getLocalDateString(d), toStr: todayStr };
+  }
+  return { fromStr: todayStr, toStr: todayStr };
+};
 
 export default function Reports() {
   const { t } = useLanguage();
   const [tab, setTab] = useState("sales");
-  const [periodKey, setPeriodKey] = useState("week");
-  const [customFrom, setCustomFrom] = useState(() => new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10));
-  const [customTo, setCustomTo] = useState(() => new Date().toISOString().slice(0, 10));
-  const [salesRows, setSalesRows] = useState([]);
+  const [salesViewMode, setSalesViewMode] = useState("summary"); // "summary" (PDF format) or "detailed"
+  const [periodKey, setPeriodKey] = useState("month");
+  const [customFrom, setCustomFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 30);
+    return getLocalDateString(d);
+  });
+  const [customTo, setCustomTo] = useState(() => getLocalDateString(new Date()));
+  const [expandedDays, setExpandedDays] = useState({});
+
+  const [restaurantInfo, setRestaurantInfo] = useState(() => {
+    try {
+      return offlineStorage.loadSettings() || null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      return offlineStorage.loadUser() || null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [dailySummaryRows, setDailySummaryRows] = useState([]);
+  const [allDetailedRows, setAllDetailedRows] = useState([]);
   const [productRows, setProductRows] = useState([]);
   const [thaliRows, setThaliRows] = useState([]);
   const [thaliPicks, setThaliPicks] = useState([]);
+  const [loading, setLoading] = useState(false);
 
-  const salesTotals = React.useMemo(() => {
-    return salesRows.reduce(
+  // Toggle accordion expand for a day's orders
+  const toggleDayExpand = (dateKey) => {
+    setExpandedDays((prev) => ({
+      ...prev,
+      [dateKey]: !prev[dateKey]
+    }));
+  };
+
+  // Grand totals across all days
+  const dailyTotals = useMemo(() => {
+    return dailySummaryRows.reduce(
       (acc, r) => {
-        acc.count += 1;
-        acc.subtotal += safeNumber(r.subtotal);
-        acc.cgst += safeNumber(r.cgst);
-        acc.sgst += safeNumber(r.sgst);
-        acc.tax += safeNumber(r.tax);
-        acc.total += safeNumber(r.total);
-        const mode = (r.payment_mode || "cash").toLowerCase();
-        if (mode === "cash") acc.cash += safeNumber(r.total);
-        else if (mode === "upi") acc.upi += safeNumber(r.total);
-        else if (mode === "card") acc.card += safeNumber(r.total);
-        else acc.other += safeNumber(r.total);
+        acc.totalBills += safeNumber(r.totalBills);
+        acc.itemsQty += safeNumber(r.itemsQty);
+        acc.totalSales += safeNumber(r.totalSales);
+        acc.sgstAmount += safeNumber(r.sgstAmount);
+        acc.cgstAmount += safeNumber(r.cgstAmount);
+        acc.totalTax += safeNumber(r.totalTax);
+        acc.grossSales += safeNumber(r.grossSales);
+        acc.cashSales += safeNumber(r.cashSales);
+        acc.upiSales += safeNumber(r.upiSales);
+        acc.cardSales += safeNumber(r.cardSales);
         return acc;
       },
-      { count: 0, subtotal: 0, cgst: 0, sgst: 0, tax: 0, total: 0, cash: 0, upi: 0, card: 0, other: 0 }
+      {
+        totalBills: 0,
+        itemsQty: 0,
+        totalSales: 0,
+        sgstAmount: 0,
+        cgstAmount: 0,
+        totalTax: 0,
+        grossSales: 0,
+        cashSales: 0,
+        upiSales: 0,
+        cardSales: 0
+      }
     );
-  }, [salesRows]);
+  }, [dailySummaryRows]);
 
-  const productTotals = React.useMemo(() => {
+  const productTotals = useMemo(() => {
     return productRows.reduce(
       (acc, r) => {
         acc.count += 1;
@@ -74,7 +169,7 @@ export default function Reports() {
     );
   }, [productRows]);
 
-  const thaliTotals = React.useMemo(() => {
+  const thaliTotals = useMemo(() => {
     return thaliRows.reduce(
       (acc, r) => {
         acc.count += 1;
@@ -86,43 +181,209 @@ export default function Reports() {
     );
   }, [thaliRows]);
 
-  const fromIso = periodKey === "custom" ? toIso(customFrom) : toIso(new Date(Date.now() - PERIODS.find(p => p.key === periodKey).days * 86400000));
-  const toIsoStr = periodKey === "custom" ? toIso(customTo, true) : toIso(new Date(), true);
+  const activeRange = useMemo(() => {
+    if (periodKey === "custom") {
+      return { fromStr: customFrom, toStr: customTo };
+    }
+    return getPresetRange(periodKey);
+  }, [periodKey, customFrom, customTo]);
 
   const fetch = useCallback(async () => {
+    setLoading(true);
     try {
-      // 1. Single Source of Truth: Read all saved orders from centralized offlineStorage
-      const allOrders = offlineStorage.getOrders();
+      // 1. Dual-Sync: Fetch local orders immediately, then sync with server
+      let combined = [];
+      try {
+        combined = offlineStorage.getOrders() || [];
+      } catch (e) {
+        console.error("Local storage read error:", e);
+      }
 
-      // Filter orders within the selected ISO range
-      const filteredOrders = allOrders.filter((o) => {
+      try {
+        const res = await api.get("/orders");
+        if (Array.isArray(res.data) && res.data.length > 0) {
+          res.data.forEach((serverOrder) => {
+            try {
+              offlineStorage.saveOrder(serverOrder);
+            } catch (_) {}
+          });
+          combined = offlineStorage.getOrders() || [];
+        }
+      } catch (apiErr) {
+        console.log("Server sync optional / offline:", apiErr.message);
+      }
+
+      // Fetch restaurant settings & user info
+      try {
+        const cachedSettings = offlineStorage.loadSettings();
+        if (cachedSettings) setRestaurantInfo(cachedSettings);
+        const sRes = await api.get("/settings");
+        if (sRes.data) {
+          setRestaurantInfo(sRes.data);
+          offlineStorage.saveSettings(sRes.data);
+        }
+      } catch (_) {}
+
+      try {
+        const cachedU = offlineStorage.loadUser();
+        if (cachedU) setCurrentUser(cachedU);
+        const uRes = await api.get("/auth/me");
+        if (uRes.data) {
+          setCurrentUser(uRes.data);
+          offlineStorage.saveUser(uRes.data);
+        }
+      } catch (_) {}
+
+      // 2. Filter orders using calendar date string (YYYY-MM-DD)
+      const filteredOrders = combined.filter((o) => {
         const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
         if (!rawDate) return false;
-        const dIso = new Date(rawDate).toISOString();
-        return dIso >= fromIso && dIso <= toIsoStr;
+        const orderDateStr = getLocalDateString(rawDate);
+        if (!orderDateStr) return false;
+        return orderDateStr >= activeRange.fromStr && orderDateStr <= activeRange.toStr;
       });
 
-      // 2. Compute Sales Rows
-      const sRows = filteredOrders.map((o) => {
+      // 3. Group by Date for Daily Sales Summary (PDF Format)
+      const dayMap = new Map();
+      const allDetailed = [];
+
+      filteredOrders.forEach((o) => {
+        const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
+        const dateKey = getLocalDateString(rawDate);
+        if (!dayMap.has(dateKey)) {
+          dayMap.set(dateKey, []);
+        }
+        dayMap.get(dateKey).push(o);
+
+        // Flatten detailed rows
+        const items = Array.isArray(o.items) ? o.items : [];
+        const orderItemQty = items.reduce((sum, it) => sum + safeNumber(it.quantity || it.qty, 1), 0);
         const subtotal = safeNumber(o.subtotal);
         const taxVal = safeNumber(o.tax !== undefined ? o.tax : (safeNumber(o.cgst) + safeNumber(o.sgst)));
         const cgstVal = safeNumber(o.cgst !== undefined ? o.cgst : (taxVal / 2));
         const sgstVal = safeNumber(o.sgst !== undefined ? o.sgst : (taxVal - cgstVal));
-        const total = safeNumber(o.grandTotal !== undefined ? o.grandTotal : o.total);
-        return {
-          id: o.id,
+        const gross = safeNumber(o.grandTotal !== undefined ? o.grandTotal : o.total);
+
+        allDetailed.push({
+          id: o.id || o.receipt_no,
           receipt_no: o.billNumber || o.orderNumber || o.receipt_no || "—",
-          paid_at: o.paid_at || o.createdAt || o.created_at,
+          paid_at: rawDate,
           payment_mode: (o.paymentMethod || o.payment_mode || "cash").toLowerCase(),
+          itemsCount: orderItemQty,
+          items: items.map((it) => ({
+            name: it.name || "Item",
+            qty: safeNumber(it.quantity || it.qty, 1),
+            price: safeNumber(it.price, 0),
+            total: safeNumber(it.total !== undefined ? it.total : (safeNumber(it.price, 0) * safeNumber(it.quantity || it.qty, 1)))
+          })),
           subtotal,
           cgst: cgstVal,
           sgst: sgstVal,
           tax: taxVal,
-          total,
+          total: gross
+        });
+      });
+
+      const sortedDates = Array.from(dayMap.keys()).sort();
+
+      const dailySummary = sortedDates.map((dateKey) => {
+        const dayOrders = dayMap.get(dateKey);
+
+        // Compute FROM-TO BILL NO
+        const billNums = dayOrders
+          .map((o) => {
+            const canonical = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
+            if (canonical > 0) return canonical;
+            const num = parseInt(String(o.receipt_no || "").replace(/\D/g, ""), 10);
+            return isNaN(num) ? 0 : num;
+          })
+          .filter((n) => n > 0)
+          .sort((a, b) => a - b);
+
+        let fromToBillNo = "—";
+        if (billNums.length > 0) {
+          const minBill = billNums[0];
+          const maxBill = billNums[billNums.length - 1];
+          fromToBillNo = minBill === maxBill ? `${minBill}` : `${minBill}-${maxBill}`;
+        } else if (dayOrders.length > 0) {
+          fromToBillNo = `${dayOrders.length} ${dayOrders.length === 1 ? "Bill" : "Bills"}`;
+        }
+
+        let dayItemsQty = 0;
+        let daySubtotal = 0;
+        let dayCgst = 0;
+        let daySgst = 0;
+        let dayTotalTax = 0;
+        let dayGross = 0;
+        let dayCash = 0;
+        let dayUpi = 0;
+        let dayCard = 0;
+
+        const dayBillDetails = dayOrders.map((o) => {
+          const items = Array.isArray(o.items) ? o.items : [];
+          const orderItemQty = items.reduce((sum, it) => sum + safeNumber(it.quantity || it.qty, 1), 0);
+          dayItemsQty += orderItemQty;
+
+          const subtotal = safeNumber(o.subtotal);
+          const taxVal = safeNumber(o.tax !== undefined ? o.tax : (safeNumber(o.cgst) + safeNumber(o.sgst)));
+          const cgstVal = safeNumber(o.cgst !== undefined ? o.cgst : (taxVal / 2));
+          const sgstVal = safeNumber(o.sgst !== undefined ? o.sgst : (taxVal - cgstVal));
+          const gross = safeNumber(o.grandTotal !== undefined ? o.grandTotal : o.total);
+          const mode = (o.paymentMethod || o.payment_mode || "cash").toLowerCase();
+
+          daySubtotal += subtotal;
+          dayCgst += cgstVal;
+          daySgst += sgstVal;
+          dayTotalTax += taxVal;
+          dayGross += gross;
+
+          if (mode === "cash") dayCash += gross;
+          else if (mode === "upi") dayUpi += gross;
+          else if (mode === "card") dayCard += gross;
+          else dayCash += gross;
+
+          return {
+            id: o.id || o.receipt_no,
+            receipt_no: o.billNumber || o.orderNumber || o.receipt_no || "—",
+            paid_at: o.paid_at || o.createdAt || o.created_at,
+            payment_mode: mode,
+            itemsCount: orderItemQty,
+            items: items.map((it) => ({
+              name: it.name || "Item",
+              qty: safeNumber(it.quantity || it.qty, 1),
+              price: safeNumber(it.price, 0),
+              total: safeNumber(it.total !== undefined ? it.total : (safeNumber(it.price, 0) * safeNumber(it.quantity || it.qty, 1)))
+            })),
+            subtotal,
+            cgst: cgstVal,
+            sgst: sgstVal,
+            tax: taxVal,
+            total: gross
+          };
+        });
+
+        return {
+          dateKey,
+          dateFormatted: formatDisplayDate(dateKey),
+          fromToBillNo,
+          totalBills: dayOrders.length,
+          itemsQty: dayItemsQty,
+          totalSales: daySubtotal,
+          sgstAmount: daySgst,
+          cgstAmount: dayCgst,
+          totalTax: dayTotalTax,
+          grossSales: dayGross,
+          cashSales: dayCash,
+          upiSales: dayUpi,
+          cardSales: dayCard,
+          orders: dayBillDetails
         };
       });
 
-      // 3. Compute Product Rows
+      setDailySummaryRows(dailySummary);
+      setAllDetailedRows(allDetailed);
+
+      // 4. Compute Product Rows with Unit Rates & Total Amounts
       const itemMap = new Map();
       filteredOrders.forEach((o) => {
         const items = Array.isArray(o.items) ? o.items : [];
@@ -131,36 +392,66 @@ export default function Reports() {
           const qty = safeNumber(it.quantity || it.qty, 1);
           const price = safeNumber(it.price, 0);
           const ebCharge = safeNumber(it.extra_bread_charge, 0);
-          const rev = safeNumber(it.revenue !== undefined ? it.revenue : (it.total !== undefined ? it.total : (price * qty + ebCharge * qty)));
+          const rev = safeNumber(
+            it.revenue !== undefined
+              ? it.revenue
+              : it.total !== undefined
+              ? it.total
+              : (price + ebCharge) * qty
+          );
           if (!itemMap.has(name)) {
-            itemMap.set(name, { name, qty: 0, revenue: 0 });
+            itemMap.set(name, { name, qty: 0, revenue: 0, prices: [] });
           }
           const cur = itemMap.get(name);
           cur.qty += qty;
           cur.revenue += rev;
+          if (price > 0) cur.prices.push(price);
         });
       });
-      const pRows = Array.from(itemMap.values()).sort((a, b) => b.revenue - a.revenue);
 
-      // 4. Compute Thali Rows & Selections
+      const pRows = Array.from(itemMap.values())
+        .map((it) => {
+          const unitRate = it.prices.length > 0 ? it.prices[0] : it.qty > 0 ? it.revenue / it.qty : 0;
+          return {
+            name: it.name,
+            rate: unitRate,
+            qty: it.qty,
+            revenue: it.revenue
+          };
+        })
+        .sort((a, b) => b.revenue - a.revenue);
+
+      // 5. Compute Thali Rows & Selections
       const thaliMap = new Map();
       const picksMap = new Map();
       filteredOrders.forEach((o) => {
         const items = Array.isArray(o.items) ? o.items : [];
         items.forEach((it) => {
-          const isThali = Boolean(it.is_thali || it.category === "THALI" || it.category_name === "THALI" || (it.name && it.name.toLowerCase().includes("thali")));
+          const isThali = Boolean(
+            it.is_thali ||
+              it.category === "THALI" ||
+              it.category_name === "THALI" ||
+              (it.name && it.name.toLowerCase().includes("thali"))
+          );
           if (isThali) {
             const name = it.name || "Thali";
             const qty = safeNumber(it.quantity || it.qty, 1);
             const price = safeNumber(it.price, 0);
             const ebCharge = safeNumber(it.extra_bread_charge, 0);
-            const rev = safeNumber(it.revenue !== undefined ? it.revenue : (it.total !== undefined ? it.total : (price * qty + ebCharge * qty)));
+            const rev = safeNumber(
+              it.revenue !== undefined
+                ? it.revenue
+                : it.total !== undefined
+                ? it.total
+                : (price + ebCharge) * qty
+            );
             if (!thaliMap.has(name)) {
-              thaliMap.set(name, { name, qty: 0, revenue: 0 });
+              thaliMap.set(name, { name, qty: 0, revenue: 0, prices: [] });
             }
             const cur = thaliMap.get(name);
             cur.qty += qty;
             cur.revenue += rev;
+            if (price > 0) cur.prices.push(price);
 
             // Aggregate selection picks
             if (it.thali_selections && typeof it.thali_selections === "object") {
@@ -177,21 +468,37 @@ export default function Reports() {
           }
         });
       });
-      const tRows = Array.from(thaliMap.values()).sort((a, b) => b.revenue - a.revenue);
-      const picksList = Array.from(picksMap.entries()).map(([name, qty]) => ({ name, qty })).sort((a, b) => b.qty - a.qty);
 
-      setSalesRows(sRows);
+      const tRows = Array.from(thaliMap.values())
+        .map((it) => {
+          const unitRate = it.prices.length > 0 ? it.prices[0] : it.qty > 0 ? it.revenue / it.qty : 0;
+          return {
+            name: it.name,
+            rate: unitRate,
+            qty: it.qty,
+            revenue: it.revenue
+          };
+        })
+        .sort((a, b) => b.revenue - a.revenue);
+
+      const picksList = Array.from(picksMap.entries())
+        .map(([name, qty]) => ({ name, qty }))
+        .sort((a, b) => b.qty - a.qty);
+
       setProductRows(pRows);
       setThaliRows(tRows);
       setThaliPicks(picksList);
     } catch (e) {
       console.error("Report calculation error:", e);
-      setSalesRows([]);
+      setDailySummaryRows([]);
+      setAllDetailedRows([]);
       setProductRows([]);
       setThaliRows([]);
       setThaliPicks([]);
+    } finally {
+      setLoading(false);
     }
-  }, [fromIso, toIsoStr]);
+  }, [activeRange]);
 
   useEffect(() => {
     fetch();
@@ -208,159 +515,302 @@ export default function Reports() {
     };
   }, [fetch]);
 
+  // Excel Export: Multi-sheet workbook formatted exactly like the PDF
+  const downloadClientXlsx = () => {
+    const restaurantName = restaurantInfo?.restaurant_name || restaurantInfo?.name || "CHEERS (C G ROAD)";
+    const fromFormatted = formatDisplayDate(activeRange.fromStr);
+    const toFormatted = formatDisplayDate(activeRange.toStr);
+    const now = new Date();
+    const printTimestamp = `${formatDisplayDate(getLocalDateString(now))} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const printedBy = currentUser?.name || currentUser?.username || "BHUPENDRA";
+
+    const wb = XLSX.utils.book_new();
+
+    // -------------------------------------------------------------
+    // SHEET 1: SALES SUMMARY REPORT (PDF Layout, Zomato/Swiggy omitted)
+    // -------------------------------------------------------------
+    const salesAoa = [
+      [restaurantName.toUpperCase()],
+      ["SALES SUMMARY REPORT"],
+      [`From Date : ${fromFormatted} To : ${toFormatted}`],
+      [],
+      [
+        "DATE",
+        "FROM-TO BILL NO",
+        "ITEMS QTY",
+        "TOTAL SALES",
+        "SGST AMOUNT",
+        "CGST AMOUNT",
+        "GROSS SALES",
+        "CASH SALES",
+        "UPI SALES",
+        "CARD SALES"
+      ]
+    ];
+
+    dailySummaryRows.forEach((r) => {
+      salesAoa.push([
+        r.dateFormatted,
+        r.fromToBillNo,
+        r.itemsQty,
+        Number(safeFixed(r.totalSales)),
+        Number(safeFixed(r.sgstAmount)),
+        Number(safeFixed(r.cgstAmount)),
+        Number(safeFixed(r.grossSales)),
+        Number(safeFixed(r.cashSales)),
+        Number(safeFixed(r.upiSales)),
+        Number(safeFixed(r.cardSales))
+      ]);
+    });
+
+    salesAoa.push([
+      "TOTAL :",
+      "",
+      dailyTotals.itemsQty,
+      Number(safeFixed(dailyTotals.totalSales)),
+      Number(safeFixed(dailyTotals.sgstAmount)),
+      Number(safeFixed(dailyTotals.cgstAmount)),
+      Number(safeFixed(dailyTotals.grossSales)),
+      Number(safeFixed(dailyTotals.cashSales)),
+      Number(safeFixed(dailyTotals.upiSales)),
+      Number(safeFixed(dailyTotals.cardSales))
+    ]);
+
+    salesAoa.push([]);
+    salesAoa.push([
+      `Print on ${printTimestamp} By ${printedBy}`,
+      "", "", "", "", "", "", "", "",
+      "Page No 1 Of 1"
+    ]);
+
+    const wsSales = XLSX.utils.aoa_to_sheet(salesAoa);
+    wsSales["!cols"] = [
+      { wch: 14 }, // DATE
+      { wch: 18 }, // FROM-TO BILL NO
+      { wch: 12 }, // ITEMS QTY
+      { wch: 15 }, // TOTAL SALES
+      { wch: 15 }, // SGST AMOUNT
+      { wch: 15 }, // CGST AMOUNT
+      { wch: 16 }, // GROSS SALES
+      { wch: 15 }, // CASH SALES
+      { wch: 15 }, // UPI SALES
+      { wch: 15 }  // CARD SALES
+    ];
+    XLSX.utils.book_append_sheet(wb, wsSales, "SALES SUMMARY REPORT");
+
+    // -------------------------------------------------------------
+    // SHEET 2: ITEM SALES REPORT (Unit Rates, Quantities, & Total Amounts)
+    // -------------------------------------------------------------
+    const itemAoa = [
+      [restaurantName.toUpperCase()],
+      ["ITEM WISE SALES REPORT"],
+      [`From Date : ${fromFormatted} To : ${toFormatted}`],
+      [],
+      ["SR NO", "ITEM NAME", "RATE (₹)", "QTY SOLD", "TOTAL AMOUNT (₹)"]
+    ];
+
+    productRows.forEach((r, i) => {
+      itemAoa.push([
+        i + 1,
+        r.name,
+        Number(safeFixed(r.rate)),
+        safeNumber(r.qty),
+        Number(safeFixed(r.revenue))
+      ]);
+    });
+
+    itemAoa.push([
+      "TOTAL :",
+      `${productTotals.count} Items`,
+      "",
+      productTotals.qty,
+      Number(safeFixed(productTotals.revenue))
+    ]);
+
+    itemAoa.push([]);
+    itemAoa.push([`Print on ${printTimestamp} By ${printedBy}`]);
+
+    const wsItems = XLSX.utils.aoa_to_sheet(itemAoa);
+    wsItems["!cols"] = [
+      { wch: 8 },  // SR NO
+      { wch: 32 }, // ITEM NAME
+      { wch: 14 }, // RATE (₹)
+      { wch: 12 }, // QTY SOLD
+      { wch: 18 }  // TOTAL AMOUNT (₹)
+    ];
+    XLSX.utils.book_append_sheet(wb, wsItems, "ITEM SALES REPORT");
+
+    // -------------------------------------------------------------
+    // SHEET 3: BILL WISE DETAILS
+    // -------------------------------------------------------------
+    const billAoa = [
+      [restaurantName.toUpperCase()],
+      ["BILL WISE DETAILED REPORT"],
+      [`From Date : ${fromFormatted} To : ${toFormatted}`],
+      [],
+      [
+        "BILL NO",
+        "DATE & TIME",
+        "ITEMS SOLD",
+        "ITEMS QTY",
+        "PAYMENT MODE",
+        "TAXABLE (₹)",
+        "CGST (₹)",
+        "SGST (₹)",
+        "TOTAL TAX (₹)",
+        "GROSS TOTAL (₹)"
+      ]
+    ];
+
+    let billCount = 0;
+    dailySummaryRows.forEach((day) => {
+      day.orders.forEach((o) => {
+        billCount++;
+        const itemDesc = (o.items || [])
+          .map((it) => `${it.name} x${it.qty} (₹${safeFixed(it.price)})`)
+          .join(", ");
+        billAoa.push([
+          o.receipt_no,
+          new Date(o.paid_at).toLocaleString("en-IN"),
+          itemDesc,
+          o.itemsCount,
+          (o.payment_mode || "cash").toUpperCase(),
+          Number(safeFixed(o.subtotal)),
+          Number(safeFixed(o.cgst)),
+          Number(safeFixed(o.sgst)),
+          Number(safeFixed(o.tax)),
+          Number(safeFixed(o.total))
+        ]);
+      });
+    });
+
+    billAoa.push([
+      "TOTAL :",
+      `${billCount} Bills`,
+      "",
+      dailyTotals.itemsQty,
+      "",
+      Number(safeFixed(dailyTotals.totalSales)),
+      Number(safeFixed(dailyTotals.sgstAmount)),
+      Number(safeFixed(dailyTotals.cgstAmount)),
+      Number(safeFixed(dailyTotals.totalTax)),
+      Number(safeFixed(dailyTotals.grossSales))
+    ]);
+
+    const wsBills = XLSX.utils.aoa_to_sheet(billAoa);
+    wsBills["!cols"] = [
+      { wch: 12 }, // BILL NO
+      { wch: 22 }, // DATE & TIME
+      { wch: 45 }, // ITEMS SOLD
+      { wch: 12 }, // ITEMS QTY
+      { wch: 15 }, // PAYMENT MODE
+      { wch: 14 }, // TAXABLE
+      { wch: 12 }, // CGST
+      { wch: 12 }, // SGST
+      { wch: 14 }, // TOTAL TAX
+      { wch: 16 }  // GROSS TOTAL
+    ];
+    XLSX.utils.book_append_sheet(wb, wsBills, "BILL WISE DETAILS");
+
+    // -------------------------------------------------------------
+    // SHEET 4: THALIS REPORT (if applicable)
+    // -------------------------------------------------------------
+    if (thaliRows.length > 0) {
+      const thaliAoa = [
+        [restaurantName.toUpperCase()],
+        ["THALI SALES REPORT"],
+        [`From Date : ${fromFormatted} To : ${toFormatted}`],
+        [],
+        ["SR NO", "THALI NAME", "RATE (₹)", "QTY SOLD", "TOTAL AMOUNT (₹)"]
+      ];
+      thaliRows.forEach((r, i) => {
+        thaliAoa.push([
+          i + 1,
+          r.name,
+          Number(safeFixed(r.rate)),
+          safeNumber(r.qty),
+          Number(safeFixed(r.revenue))
+        ]);
+      });
+      thaliAoa.push([
+        "TOTAL :",
+        `${thaliTotals.count} Thalis`,
+        "",
+        thaliTotals.qty,
+        Number(safeFixed(thaliTotals.revenue))
+      ]);
+
+      if (thaliPicks.length > 0) {
+        thaliAoa.push([]);
+        thaliAoa.push(["--- POPULAR THALI SELECTIONS ---"]);
+        thaliAoa.push(["SELECTION ITEM", "TIMES ORDERED"]);
+        thaliPicks.forEach((p) => {
+          thaliAoa.push([p.name, p.qty]);
+        });
+      }
+
+      const wsThalis = XLSX.utils.aoa_to_sheet(thaliAoa);
+      wsThalis["!cols"] = [
+        { wch: 8 },
+        { wch: 30 },
+        { wch: 14 },
+        { wch: 12 },
+        { wch: 18 }
+      ];
+      XLSX.utils.book_append_sheet(wb, wsThalis, "THALIS REPORT");
+    }
+
+    XLSX.writeFile(wb, `Sales_Summary_Report_${activeRange.fromStr}_to_${activeRange.toStr}.xlsx`);
+    toast.success("Excel Report Downloaded Successfully");
+  };
+
+  // CSV Export: Exact PDF format
   const downloadClientCsv = () => {
+    const restaurantName = restaurantInfo?.restaurant_name || restaurantInfo?.name || "CHEERS (C G ROAD)";
+    const fromFormatted = formatDisplayDate(activeRange.fromStr);
+    const toFormatted = formatDisplayDate(activeRange.toStr);
+    const now = new Date();
+    const printTimestamp = `${formatDisplayDate(getLocalDateString(now))} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const printedBy = currentUser?.name || currentUser?.username || "BHUPENDRA";
+
     let csvContent = "";
     if (tab === "sales") {
-      csvContent = "Bill Number,Date,Payment Mode,Subtotal,CGST,SGST,Total Tax,Total\n";
-      salesRows.forEach((r) => {
-        csvContent += `${r.receipt_no},"${new Date(r.paid_at).toLocaleDateString("en-IN")}",${r.payment_mode},${safeFixed(r.subtotal)},${safeFixed(r.cgst)},${safeFixed(r.sgst)},${safeFixed(r.tax)},${safeFixed(r.total)}\n`;
+      csvContent += `"${restaurantName.toUpperCase()}"\n`;
+      csvContent += `"SALES SUMMARY REPORT"\n`;
+      csvContent += `"From Date : ${fromFormatted} To : ${toFormatted}"\n\n`;
+      csvContent += "DATE,FROM-TO BILL NO,ITEMS QTY,TOTAL SALES,SGST AMOUNT,CGST AMOUNT,GROSS SALES,CASH SALES,UPI SALES,CARD SALES\n";
+      dailySummaryRows.forEach((r) => {
+        csvContent += `"${r.dateFormatted}","${r.fromToBillNo}",${r.itemsQty},${safeFixed(r.totalSales)},${safeFixed(r.sgstAmount)},${safeFixed(r.cgstAmount)},${safeFixed(r.grossSales)},${safeFixed(r.cashSales)},${safeFixed(r.upiSales)},${safeFixed(r.cardSales)}\n`;
       });
-      if (salesRows.length > 0) {
-        csvContent += `TOTAL,${salesTotals.count} Bills,—,${safeFixed(salesTotals.subtotal)},${safeFixed(salesTotals.cgst)},${safeFixed(salesTotals.sgst)},${safeFixed(salesTotals.tax)},${safeFixed(salesTotals.total)}\n`;
-        csvContent += `\n`;
-        csvContent += `"--- AGGREGATE TOTALS SUMMARY ---"\n`;
-        csvContent += `"Total Number of Bills",${salesTotals.count}\n`;
-        csvContent += `"Total Taxable Amount (Subtotal)",${safeFixed(salesTotals.subtotal)}\n`;
-        csvContent += `"Total CGST Collected",${safeFixed(salesTotals.cgst)}\n`;
-        csvContent += `"Total SGST Collected",${safeFixed(salesTotals.sgst)}\n`;
-        csvContent += `"Total Tax Collected",${safeFixed(salesTotals.tax)}\n`;
-        csvContent += `"Total Amount Collected (Gross Sales)",${safeFixed(salesTotals.total)}\n`;
-        csvContent += `\n`;
-        csvContent += `"--- PAYMENT MODE BREAKDOWN ---"\n`;
-        csvContent += `"Total Cash Collected",${safeFixed(salesTotals.cash)}\n`;
-        csvContent += `"Total UPI Collected",${safeFixed(salesTotals.upi)}\n`;
-        csvContent += `"Total Card Collected",${safeFixed(salesTotals.card)}\n`;
-      }
+      csvContent += `"TOTAL :","",${dailyTotals.itemsQty},${safeFixed(dailyTotals.totalSales)},${safeFixed(dailyTotals.sgstAmount)},${safeFixed(dailyTotals.cgstAmount)},${safeFixed(dailyTotals.grossSales)},${safeFixed(dailyTotals.cashSales)},${safeFixed(dailyTotals.upiSales)},${safeFixed(dailyTotals.cardSales)}\n\n`;
+      csvContent += `"Print on ${printTimestamp} By ${printedBy}","","","","","","","","","Page No 1 Of 1"\n`;
     } else if (tab === "products") {
-      csvContent = "Sr,Item,Qty Sold,Revenue\n";
+      csvContent += `"${restaurantName.toUpperCase()}"\n`;
+      csvContent += `"ITEM WISE SALES REPORT"\n`;
+      csvContent += `"From Date : ${fromFormatted} To : ${toFormatted}"\n\n`;
+      csvContent += "SR NO,ITEM NAME,RATE (Rs),QTY SOLD,TOTAL AMOUNT (Rs)\n";
       productRows.forEach((r, i) => {
-        csvContent += `${i + 1},"${r.name}",${safeNumber(r.qty)},${safeFixed(r.revenue)}\n`;
+        csvContent += `${i + 1},"${r.name}",${safeFixed(r.rate)},${safeNumber(r.qty)},${safeFixed(r.revenue)}\n`;
       });
-      if (productRows.length > 0) {
-        csvContent += `TOTAL,${productTotals.count} Items,${safeNumber(productTotals.qty)},${safeFixed(productTotals.revenue)}\n`;
-        csvContent += `\n`;
-        csvContent += `"--- AGGREGATE TOTALS SUMMARY ---"\n`;
-        csvContent += `"Total Number of Items",${productTotals.count}\n`;
-        csvContent += `"Total Quantity Sold",${safeNumber(productTotals.qty)}\n`;
-        csvContent += `"Total Revenue Collected",${safeFixed(productTotals.revenue)}\n`;
-      }
+      csvContent += `"TOTAL :","${productTotals.count} Items","",${safeNumber(productTotals.qty)},${safeFixed(productTotals.revenue)}\n`;
     } else {
-      csvContent = "Sr,Thali,Qty Sold,Revenue\n";
+      csvContent += `"${restaurantName.toUpperCase()}"\n`;
+      csvContent += `"THALI SALES REPORT"\n`;
+      csvContent += `"From Date : ${fromFormatted} To : ${toFormatted}"\n\n`;
+      csvContent += "SR NO,THALI NAME,RATE (Rs),QTY SOLD,TOTAL AMOUNT (Rs)\n";
       thaliRows.forEach((r, i) => {
-        csvContent += `${i + 1},"${r.name}",${safeNumber(r.qty)},${safeFixed(r.revenue)}\n`;
+        csvContent += `${i + 1},"${r.name}",${safeFixed(r.rate)},${safeNumber(r.qty)},${safeFixed(r.revenue)}\n`;
       });
-      if (thaliRows.length > 0) {
-        csvContent += `TOTAL,${thaliTotals.count} Thalis,${safeNumber(thaliTotals.qty)},${safeFixed(thaliTotals.revenue)}\n`;
-        csvContent += `\n`;
-        csvContent += `"--- AGGREGATE TOTALS SUMMARY ---"\n`;
-        csvContent += `"Total Number of Thalis",${thaliTotals.count}\n`;
-        csvContent += `"Total Quantity Sold",${safeNumber(thaliTotals.qty)}\n`;
-        csvContent += `"Total Revenue Collected",${safeFixed(thaliTotals.revenue)}\n`;
-      }
+      csvContent += `"TOTAL :","${thaliTotals.count} Thalis","",${safeNumber(thaliTotals.qty)},${safeFixed(thaliTotals.revenue)}\n`;
     }
+
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = `${tab}_report_${fromIso.slice(0, 10)}_to_${toIsoStr.slice(0, 10)}.csv`;
+    link.download = `Sales_Summary_${activeRange.fromStr}_to_${activeRange.toStr}.csv`;
     link.click();
     URL.revokeObjectURL(link.href);
-    toast.success(`${t("exported") || "Exported"} CSV`);
-  };
-
-  const downloadClientXlsx = () => {
-    let data = [];
-    let summaryRows = [];
-    if (tab === "sales") {
-      data = salesRows.map((r) => ({
-        "Bill Number": r.receipt_no,
-        "Date": new Date(r.paid_at).toLocaleDateString("en-IN"),
-        "Payment Mode": (r.payment_mode || "cash").toUpperCase(),
-        "Subtotal": Number(safeFixed(r.subtotal)),
-        "CGST": Number(safeFixed(r.cgst)),
-        "SGST": Number(safeFixed(r.sgst)),
-        "Total Tax": Number(safeFixed(r.tax)),
-        "Total": Number(safeFixed(r.total)),
-      }));
-      if (salesRows.length > 0) {
-        data.push({
-          "Bill Number": "TOTAL",
-          "Date": `${salesTotals.count} Bills`,
-          "Payment Mode": "—",
-          "Subtotal": Number(safeFixed(salesTotals.subtotal)),
-          "CGST": Number(safeFixed(salesTotals.cgst)),
-          "SGST": Number(safeFixed(salesTotals.sgst)),
-          "Total Tax": Number(safeFixed(salesTotals.tax)),
-          "Total": Number(safeFixed(salesTotals.total)),
-        });
-        summaryRows = [
-          [],
-          ["--- AGGREGATE TOTALS SUMMARY ---"],
-          ["Total Number of Bills", salesTotals.count],
-          ["Total Subtotal (Taxable Amount)", Number(safeFixed(salesTotals.subtotal))],
-          ["Total CGST Collected", Number(safeFixed(salesTotals.cgst))],
-          ["Total SGST Collected", Number(safeFixed(salesTotals.sgst))],
-          ["Total Tax Collected", Number(safeFixed(salesTotals.tax))],
-          ["Total Amount Collected (Gross Sales)", Number(safeFixed(salesTotals.total))],
-          [],
-          ["--- PAYMENT MODE BREAKDOWN ---"],
-          ["Total Cash Collected", Number(safeFixed(salesTotals.cash))],
-          ["Total UPI Collected", Number(safeFixed(salesTotals.upi))],
-          ["Total Card Collected", Number(safeFixed(salesTotals.card))],
-        ];
-      }
-    } else if (tab === "products") {
-      data = productRows.map((r, i) => ({
-        "Sr": i + 1,
-        "Item": r.name,
-        "Qty Sold": safeNumber(r.qty),
-        "Revenue": Number(safeFixed(r.revenue)),
-      }));
-      if (productRows.length > 0) {
-        data.push({
-          "Sr": "TOTAL",
-          "Item": `${productTotals.count} Items`,
-          "Qty Sold": safeNumber(productTotals.qty),
-          "Revenue": Number(safeFixed(productTotals.revenue)),
-        });
-        summaryRows = [
-          [],
-          ["--- AGGREGATE TOTALS SUMMARY ---"],
-          ["Total Number of Items", productTotals.count],
-          ["Total Quantity Sold", safeNumber(productTotals.qty)],
-          ["Total Revenue Collected", Number(safeFixed(productTotals.revenue))],
-        ];
-      }
-    } else {
-      data = thaliRows.map((r, i) => ({
-        "Sr": i + 1,
-        "Thali": r.name,
-        "Qty Sold": safeNumber(r.qty),
-        "Revenue": Number(safeFixed(r.revenue)),
-      }));
-      if (thaliRows.length > 0) {
-        data.push({
-          "Sr": "TOTAL",
-          "Thali": `${thaliTotals.count} Thalis`,
-          "Qty Sold": safeNumber(thaliTotals.qty),
-          "Revenue": Number(safeFixed(thaliTotals.revenue)),
-        });
-        summaryRows = [
-          [],
-          ["--- AGGREGATE TOTALS SUMMARY ---"],
-          ["Total Number of Thalis", thaliTotals.count],
-          ["Total Quantity Sold", safeNumber(thaliTotals.qty)],
-          ["Total Revenue Collected", Number(safeFixed(thaliTotals.revenue))],
-        ];
-      }
-    }
-    const ws = XLSX.utils.json_to_sheet(data);
-    if (summaryRows.length > 0) {
-      XLSX.utils.sheet_add_aoa(ws, summaryRows, { origin: -1 });
-    }
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, tab.toUpperCase());
-    XLSX.writeFile(wb, `${tab}_report_${fromIso.slice(0, 10)}_to_${toIsoStr.slice(0, 10)}.xlsx`);
-    toast.success(`${t("exported") || "Exported"} Excel`);
+    toast.success("CSV Report Downloaded Successfully");
   };
 
   const download = (fmt) => {
@@ -371,147 +821,392 @@ export default function Reports() {
     }
   };
 
+  const restaurantDisplayName = restaurantInfo?.restaurant_name || restaurantInfo?.name || "CHEERS (C G ROAD)";
+  const fromFormattedDate = formatDisplayDate(activeRange.fromStr);
+  const toFormattedDate = formatDisplayDate(activeRange.toStr);
+  const printTimestamp = `${formatDisplayDate(getLocalDateString(new Date()))} ${String(new Date().getHours()).padStart(2, '0')}:${String(new Date().getMinutes()).padStart(2, '0')}`;
+  const cashierDisplayName = currentUser?.name || currentUser?.username || "BHUPENDRA";
+
   return (
     <div className="h-full bg-[#FFFDF9] rounded-[20px] md:rounded-[28px] lg:rounded-[32px] border border-[#F4E6D7] shadow-lg p-4 sm:p-5 md:p-6 lg:p-8 flex flex-col overflow-hidden">
-      <div className="mb-6 flex items-end justify-between">
+      {/* Top Header Bar */}
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-4">
         <div>
-          <div className="text-[15px] uppercase tracking-[0.1em] font-bold bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] bg-clip-text text-transparent">Analytics</div>
-          <h1 className="font-display text-3xl font-extrabold tracking-tight text-slate-900">{t("nav_reports") || "Reports"}</h1>
+          <div className="text-[14px] uppercase tracking-[0.15em] font-extrabold bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] bg-clip-text text-transparent">
+            {restaurantDisplayName}
+          </div>
+          <h1 className="font-display text-2xl sm:text-3xl font-extrabold tracking-tight text-slate-900">
+            {tab === "sales" ? "SALES SUMMARY REPORT" : tab === "products" ? "ITEM WISE SALES REPORT" : "THALI SALES REPORT"}
+          </h1>
+          <div className="text-xs font-semibold text-slate-500 mt-0.5">
+            From Date : <span className="font-mono text-slate-800">{fromFormattedDate}</span> To : <span className="font-mono text-slate-800">{toFormattedDate}</span>
+          </div>
         </div>
-        <div className="flex gap-2 items-center">
-          <Button onClick={() => download("csv")} variant="outline" className="text-white border-[#F4E6D7] bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] hover:bg-[#FFF8F2] rounded-xl cursor-pointer" data-testid="export-csv">
-            <FileText className="w-4 h-4 mr-2" /> {t("export_csv") || "Export CSV"}
+
+        <div className="flex gap-2 items-center flex-wrap">
+          <Button
+            onClick={() => download("csv")}
+            variant="outline"
+            className="text-white border-[#F4E6D7] bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] hover:bg-[#FFF8F2] rounded-xl cursor-pointer shadow-sm text-xs h-9 px-3.5"
+            data-testid="export-csv"
+          >
+            <FileText className="w-4 h-4 mr-1.5" /> {t("export_csv") || "Export CSV"}
           </Button>
-          <Button onClick={() => download("xlsx")} className="bg-gradient-to-r from-[#78A61A] to-[#5F9210] hover:brightness-105 rounded-xl cursor-pointer" data-testid="export-excel">
-            <FileSpreadsheet className="w-4 h-4 mr-2" /> {t("export_excel") || "Export Excel"}
+          <Button
+            onClick={() => download("xlsx")}
+            className="bg-gradient-to-r from-[#78A61A] to-[#5F9210] hover:brightness-105 text-white rounded-xl cursor-pointer shadow-sm text-xs h-9 px-3.5"
+            data-testid="export-excel"
+          >
+            <FileSpreadsheet className="w-4 h-4 mr-1.5" /> {t("export_excel") || "Export Excel"}
           </Button>
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-3 mb-4">
-        <div className="flex items-center gap-7 p-2 bg-[#FFF8F2] border border-[#F4E6D7] rounded-full" data-testid="report-tabs">
-          {REPORT_TABS.map(tTab => {
-            let label = tTab.label;
-            if (tTab.key === "sales") label = t("tab_sales") || "Daily Sales";
-            if (tTab.key === "products") label = t("tab_products") || "Products";
-            if (tTab.key === "thalis") label = t("tab_thali") || "Thalis";
-            return (
-              <button key={tTab.key} onClick={() => setTab(tTab.key)} data-testid={`report-${tTab.key}`}
-                className={`flex items-center gap-2 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider rounded-md transition-all cursor-pointer ${tab === tTab.key ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white" : "text-muted-foreground hover:text-foreground"
-                  }`}>
-                <tTab.icon className="w-3.5 h-3.5" /> {label}
-              </button>
-            );
-          })}
+      {/* Filter and Tab Selectors */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Report Category Tabs */}
+          <div className="flex items-center gap-1 p-1 bg-[#FFF8F2] border border-[#F4E6D7] rounded-xl" data-testid="report-tabs">
+            {REPORT_TABS.map((tTab) => {
+              let label = tTab.label;
+              if (tTab.key === "sales") label = t("tab_sales") || "Daily Sales";
+              if (tTab.key === "products") label = t("tab_products") || "Products";
+              if (tTab.key === "thalis") label = t("tab_thali") || "Thalis";
+              return (
+                <button
+                  key={tTab.key}
+                  onClick={() => setTab(tTab.key)}
+                  data-testid={`report-${tTab.key}`}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded-lg transition-all cursor-pointer ${
+                    tab === tTab.key
+                      ? "bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white shadow-sm"
+                      : "text-slate-600 hover:text-slate-900 hover:bg-[#FCEEE2]"
+                  }`}
+                >
+                  <tTab.icon className="w-3.5 h-3.5" /> {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Time Period Tabs */}
+          <div className="flex items-center gap-1 p-1 bg-[#FFF8F2] border border-[#F4E6D7] rounded-xl" data-testid="period-tabs">
+            {PERIODS.map((p) => {
+              let label = p.label;
+              if (p.key === "today") label = t("today") || "Today";
+              if (p.key === "week") label = t("last_7_days") || "Last 7 days";
+              if (p.key === "month") label = t("last_30_days") || "Last 30 days";
+              if (p.key === "custom") label = t("custom_range") || "Custom";
+              return (
+                <button
+                  key={p.key}
+                  onClick={() => setPeriodKey(p.key)}
+                  data-testid={`rperiod-${p.key}`}
+                  className={`px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded-lg transition-all cursor-pointer ${
+                    periodKey === p.key
+                      ? "bg-gradient-to-r from-[#78A61A] to-[#5F9210] text-white shadow-sm"
+                      : "text-slate-600 hover:text-slate-900 hover:bg-[#FCEEE2]"
+                  }`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Custom Date Inputs */}
+          {periodKey === "custom" && (
+            <div className="flex gap-1.5 items-center bg-[#FFF8F2] border border-[#F4E6D7] p-1 rounded-xl">
+              <Input
+                type="date"
+                value={customFrom}
+                onChange={(e) => setCustomFrom(e.target.value)}
+                className="w-36 h-8 text-xs bg-white"
+                data-testid="custom-from"
+              />
+              <span className="text-muted-foreground text-xs font-medium px-0.5">{t("to") || "to"}</span>
+              <Input
+                type="date"
+                value={customTo}
+                onChange={(e) => setCustomTo(e.target.value)}
+                className="w-36 h-8 text-xs bg-white"
+                data-testid="custom-to"
+              />
+            </div>
+          )}
         </div>
 
-        <div className="flex items-center gap-7 p-2 bg-[#FFF8F2] border border-[#F4E6D7] rounded-full" data-testid="period-tabs">
-          {PERIODS.map(p => {
-            let label = p.label;
-            if (p.key === "today") label = t("today") || "Today";
-            if (p.key === "week") label = t("last_7_days") || "Last 7 days";
-            if (p.key === "month") label = t("last_30_days") || "Last 30 days";
-            if (p.key === "custom") label = t("custom_range") || "Custom Range";
-            return (
-              <button key={p.key} onClick={() => setPeriodKey(p.key)} data-testid={`rperiod-${p.key}`}
-                className={`px-3 py-1.5 text-xs font-semibold uppercase tracking-wider rounded-md transition-all cursor-pointer ${periodKey === p.key ? "bg-gradient-to-r from-[#78A61A] to-[#5F9210] text-white" : "text-muted-foreground hover:text-foreground"
-                  }`}>
-                {label}
-              </button>
-            );
-          })}
-        </div>
-
-        {periodKey === "custom" && (
-          <div className="flex gap-2 items-center">
-            <Input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)} className="w-40" data-testid="custom-from" />
-            <span className="text-muted-foreground text-xs">{t("to") || "to"}</span>
-            <Input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)} className="w-40" data-testid="custom-to" />
+        {/* View Toggle for Sales tab: Daily Summary (PDF) vs Bill-Wise */}
+        {tab === "sales" && (
+          <div className="flex items-center gap-1 bg-[#FFF8F2] border border-[#F4E6D7] p-1 rounded-xl">
+            <button
+              onClick={() => setSalesViewMode("summary")}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                salesViewMode === "summary"
+                  ? "bg-white text-slate-900 shadow-sm border border-[#F4E6D7]"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5 text-[#FF6B00]" /> Daily Summary (PDF)
+            </button>
+            <button
+              onClick={() => setSalesViewMode("detailed")}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                salesViewMode === "detailed"
+                  ? "bg-white text-slate-900 shadow-sm border border-[#F4E6D7]"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              <List className="w-3.5 h-3.5 text-[#78A61A]" /> Bill-Wise
+            </button>
           </div>
         )}
       </div>
 
-      <Card className="flex-1 overflow-hidden rounded-2xl border-[#F4E6D7] bg-white flex flex-col">
+      {/* Main Table Card */}
+      <Card className="flex-1 overflow-hidden rounded-2xl border-[#F4E6D7] bg-white flex flex-col shadow-sm">
         <div className="flex-1 overflow-y-auto">
-          {tab === "sales" && (
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-semibold tracking-[0.18em]">
+          {/* TAB 1: DAILY SALES SUMMARY (Exact format from PDF) */}
+          {tab === "sales" && salesViewMode === "summary" && (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-bold tracking-[0.14em]">
                 <tr>
-                  <th className="text-left px-4 py-3">BILL NUMBER</th>
-                  <th className="text-left px-4 py-3">{t("date_col") || "Date & Time"}</th>
-                  <th className="text-left px-4 py-3">{t("payment_col") || "Payment"}</th>
-                  <th className="text-right px-4 py-3">{t("subtotal") || "Subtotal"}</th>
-                  <th className="text-right px-4 py-3">CGST</th>
-                  <th className="text-right px-4 py-3">SGST</th>
-                  <th className="text-right px-4 py-3">Total Tax</th>
-                  <th className="text-right px-4 py-3">{t("total") || "Total"}</th>
+                  <th className="text-left px-3.5 py-3">DATE</th>
+                  <th className="text-left px-3.5 py-3">FROM-TO BILL NO</th>
+                  <th className="text-right px-3.5 py-3">ITEMS QTY</th>
+                  <th className="text-right px-3.5 py-3">TOTAL SALES</th>
+                  <th className="text-right px-3.5 py-3">SGST AMOUNT</th>
+                  <th className="text-right px-3.5 py-3">CGST AMOUNT</th>
+                  <th className="text-right px-3.5 py-3">GROSS SALES</th>
+                  <th className="text-right px-3.5 py-3">CASH SALES</th>
+                  <th className="text-right px-3.5 py-3">UPI SALES</th>
+                  <th className="text-right px-3.5 py-3">CARD SALES</th>
+                  <th className="text-center px-3 py-3">BILLS</th>
                 </tr>
               </thead>
-              <tbody data-testid="sales-table">
-                {salesRows.map(o => {
-                  let paymentModeLabel = (o.payment_mode || "cash").toUpperCase();
-                  if (o.payment_mode === "cash") paymentModeLabel = t("cash") || "CASH";
-                  if (o.payment_mode === "upi") paymentModeLabel = t("upi") || "UPI";
-                  if (o.payment_mode === "card") paymentModeLabel = t("card") || "CARD";
+              <tbody data-testid="sales-summary-table">
+                {dailySummaryRows.map((r) => {
+                  const isExpanded = !!expandedDays[r.dateKey];
                   return (
-                    <tr key={o.id || o.receipt_no} className="border-t border-border hover:bg-[#FFF8F2]">
-                      <td className="px-4 py-3 font-mono font-semibold">#{o.receipt_no}</td>
-                      <td className="px-4 py-3 text-muted-foreground text-xs">{new Date(o.paid_at).toLocaleString('en-IN')}</td>
-                      <td className="px-4 py-3 uppercase text-xs font-mono font-bold">{paymentModeLabel}</td>
-                      <td className="px-4 py-3 text-right font-mono">₹{safeFixed(o.subtotal)}</td>
-                      <td className="px-4 py-3 text-right font-mono">₹{safeFixed(o.cgst)}</td>
-                      <td className="px-4 py-3 text-right font-mono">₹{safeFixed(o.sgst)}</td>
-                      <td className="px-4 py-3 text-right font-mono">₹{safeFixed(o.tax)}</td>
-                      <td className="px-4 py-3 text-right font-mono font-bold text-slate-900">₹{safeFixed(o.total)}</td>
-                    </tr>
+                    <React.Fragment key={r.dateKey}>
+                      <tr
+                        onClick={() => toggleDayExpand(r.dateKey)}
+                        className={`border-t border-[#F4E6D7] hover:bg-[#FFF8F2] cursor-pointer transition-colors ${
+                          isExpanded ? "bg-[#FFF4E8]" : ""
+                        }`}
+                      >
+                        <td className="px-3.5 py-3 font-semibold text-slate-900 font-mono flex items-center gap-1.5">
+                          {isExpanded ? (
+                            <ChevronDown className="w-3.5 h-3.5 text-[#FF6B00]" />
+                          ) : (
+                            <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                          )}
+                          {r.dateFormatted}
+                        </td>
+                        <td className="px-3.5 py-3 font-mono text-slate-700 font-bold">{r.fromToBillNo}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-bold text-slate-900">{r.itemsQty}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-semibold text-slate-800">₹{safeFixed(r.totalSales)}</td>
+                        <td className="px-3.5 py-3 text-right font-mono text-slate-600">₹{safeFixed(r.sgstAmount)}</td>
+                        <td className="px-3.5 py-3 text-right font-mono text-slate-600">₹{safeFixed(r.cgstAmount)}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-black text-slate-900">₹{safeFixed(r.grossSales)}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-semibold text-emerald-700">₹{safeFixed(r.cashSales)}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-semibold text-blue-700">₹{safeFixed(r.upiSales)}</td>
+                        <td className="px-3.5 py-3 text-right font-mono font-semibold text-purple-700">₹{safeFixed(r.cardSales)}</td>
+                        <td className="px-3 py-3 text-center">
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[#FFF0E0] text-[#FF6B00] border border-[#F4D2BA]">
+                            {r.totalBills} {r.totalBills === 1 ? "Bill" : "Bills"}
+                          </span>
+                        </td>
+                      </tr>
+
+                      {/* Expandable nested view of bills on that date */}
+                      {isExpanded && (
+                        <tr className="bg-[#FFFDF9] border-t border-b border-[#F4E6D7]">
+                          <td colSpan="11" className="p-3 pl-8">
+                            <div className="bg-white border border-[#F4E6D7] rounded-xl overflow-hidden shadow-inner">
+                              <div className="bg-[#FFF8F2] px-4 py-2 border-b border-[#F4E6D7] flex items-center justify-between text-[11px] font-bold text-slate-700">
+                                <span>Itemized Bills for {r.dateFormatted} ({r.totalBills} Orders)</span>
+                                <span className="text-[#FF6B00]">Total Items Sold: {r.itemsQty}</span>
+                              </div>
+                              <table className="w-full text-xs">
+                                <thead className="bg-[#FFFBF7] text-slate-500 text-[10px] uppercase font-bold border-b border-[#F4E6D7]">
+                                  <tr>
+                                    <th className="text-left px-3 py-2">Bill #</th>
+                                    <th className="text-left px-3 py-2">Time</th>
+                                    <th className="text-left px-3 py-2">Items (Name x Qty @ Rate)</th>
+                                    <th className="text-right px-3 py-2">Items Qty</th>
+                                    <th className="text-left px-3 py-2">Payment</th>
+                                    <th className="text-right px-3 py-2">Subtotal</th>
+                                    <th className="text-right px-3 py-2">Tax</th>
+                                    <th className="text-right px-3 py-2">Gross Total</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {r.orders.map((o) => (
+                                    <tr key={o.id || o.receipt_no} className="border-t border-[#F8EFE6] hover:bg-[#FFFDF9]">
+                                      <td className="px-3 py-2 font-mono font-bold text-slate-900">#{o.receipt_no}</td>
+                                      <td className="px-3 py-2 text-slate-500 text-[11px]">
+                                        {new Date(o.paid_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
+                                      </td>
+                                      <td className="px-3 py-2">
+                                        <div className="flex flex-wrap gap-1">
+                                          {o.items.map((it, idx) => (
+                                            <span key={idx} className="inline-block px-1.5 py-0.5 rounded bg-[#FFF5EA] border border-[#F4D8C4] text-[10px] text-slate-800 font-medium">
+                                              {it.name} <strong className="font-mono text-[#FF6B00]">×{it.qty}</strong> <span className="text-slate-500 font-mono">(₹{safeFixed(it.price)})</span>
+                                            </span>
+                                          ))}
+                                        </div>
+                                      </td>
+                                      <td className="px-3 py-2 text-right font-mono font-bold text-slate-800">{o.itemsCount}</td>
+                                      <td className="px-3 py-2 font-mono uppercase text-[10px] font-bold text-slate-700">{o.payment_mode}</td>
+                                      <td className="px-3 py-2 text-right font-mono text-slate-700">₹{safeFixed(o.subtotal)}</td>
+                                      <td className="px-3 py-2 text-right font-mono text-slate-600">₹{safeFixed(o.tax)}</td>
+                                      <td className="px-3 py-2 text-right font-mono font-bold text-slate-900">₹{safeFixed(o.total)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
-                {salesRows.length === 0 && <tr><td colSpan="8" className="text-center text-muted-foreground py-10">{t("no_sales_in_period") || "No sales found for this period"}</td></tr>}
+
+                {dailySummaryRows.length === 0 && (
+                  <tr>
+                    <td colSpan="11" className="text-center text-muted-foreground py-12">
+                      {loading ? "Loading reports..." : t("no_sales_in_period") || "No sales found for this period"}
+                    </td>
+                  </tr>
+                )}
               </tbody>
-              {salesRows.length > 0 && (
+
+              {/* TOTAL ROW (Exact format from PDF) */}
+              {dailySummaryRows.length > 0 && (
                 <tfoot className="sticky bottom-0 z-10 bg-[#FFF5EA] border-t-2 border-b-2 border-[#FF8A3D] shadow-[0_-4px_12px_rgba(0,0,0,0.06)]" data-testid="sales-total-row">
                   <tr className="border-t-2 border-b-2 border-[#FF8A3D]">
-                    <td className="px-4 py-3.5 font-mono font-black tracking-wider text-[#FF6B00] text-sm">TOTAL :</td>
-                    <td className="px-4 py-3.5 text-xs font-bold text-slate-800">{salesTotals.count} {salesTotals.count === 1 ? (t("bill") || "Bill") : (t("bills") || "Bills")}</td>
-                    <td className="px-4 py-3.5 text-xs font-mono text-slate-400">—</td>
-                    <td className="px-4 py-3.5 text-right font-mono font-bold text-slate-900">₹{safeFixed(salesTotals.subtotal)}</td>
-                    <td className="px-4 py-3.5 text-right font-mono font-bold text-slate-900">₹{safeFixed(salesTotals.cgst)}</td>
-                    <td className="px-4 py-3.5 text-right font-mono font-bold text-slate-900">₹{safeFixed(salesTotals.sgst)}</td>
-                    <td className="px-4 py-3.5 text-right font-mono font-bold text-slate-900">₹{safeFixed(salesTotals.tax)}</td>
-                    <td className="px-4 py-3.5 text-right font-mono font-black text-[#FF6B00] text-base">₹{safeFixed(salesTotals.total)}</td>
+                    <td className="px-3.5 py-3 font-mono font-black tracking-wider text-[#FF6B00] text-sm">TOTAL :</td>
+                    <td className="px-3.5 py-3 text-xs font-bold text-slate-800">{dailyTotals.totalBills} Bills</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-black text-slate-900 text-sm">{dailyTotals.itemsQty}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-slate-900">₹{safeFixed(dailyTotals.totalSales)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-slate-900">₹{safeFixed(dailyTotals.sgstAmount)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-slate-900">₹{safeFixed(dailyTotals.cgstAmount)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-black text-[#FF6B00] text-base">₹{safeFixed(dailyTotals.grossSales)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-emerald-800">₹{safeFixed(dailyTotals.cashSales)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-blue-800">₹{safeFixed(dailyTotals.upiSales)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-purple-800">₹{safeFixed(dailyTotals.cardSales)}</td>
+                    <td className="px-3 py-3"></td>
                   </tr>
                 </tfoot>
               )}
             </table>
           )}
 
-          {tab === "products" && (
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-semibold tracking-[0.18em]">
+          {/* TAB 1 ALTERNATE: DETAILED BILL WISE */}
+          {tab === "sales" && salesViewMode === "detailed" && (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-bold tracking-[0.14em]">
                 <tr>
-                  <th className="text-left px-4 py-3">Sr.</th>
-                  <th className="text-left px-4 py-3">{t("item") || "Item"}</th>
-                  <th className="text-right px-4 py-3">{t("qty_sold") || "Qty Sold"}</th>
-                  <th className="text-right px-4 py-3">{t("revenue") || "Revenue"}</th>
+                  <th className="text-left px-3.5 py-3">BILL #</th>
+                  <th className="text-left px-3.5 py-3">DATE & TIME</th>
+                  <th className="text-left px-3.5 py-3">ITEMS (QTY @ RATE)</th>
+                  <th className="text-right px-3.5 py-3">ITEMS QTY</th>
+                  <th className="text-left px-3.5 py-3">PAYMENT</th>
+                  <th className="text-right px-3.5 py-3">TAXABLE</th>
+                  <th className="text-right px-3.5 py-3">CGST</th>
+                  <th className="text-right px-3.5 py-3">SGST</th>
+                  <th className="text-right px-3.5 py-3">TOTAL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allDetailedRows.map((o) => (
+                  <tr key={o.id || o.receipt_no} className="border-t border-[#F4E6D7] hover:bg-[#FFF8F2]">
+                    <td className="px-3.5 py-3 font-mono font-bold text-slate-900">#{o.receipt_no}</td>
+                    <td className="px-3.5 py-3 text-slate-500 font-mono">{new Date(o.paid_at).toLocaleString("en-IN")}</td>
+                    <td className="px-3.5 py-3">
+                      <div className="flex flex-wrap gap-1">
+                        {o.items.map((it, idx) => (
+                          <span key={idx} className="inline-block px-1.5 py-0.5 rounded bg-[#FFF5EA] border border-[#F4D8C4] text-[10px] text-slate-800 font-medium">
+                            {it.name} <strong className="font-mono text-[#FF6B00]">×{it.qty}</strong> (₹{safeFixed(it.price)})
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-slate-800">{o.itemsCount}</td>
+                    <td className="px-3.5 py-3 uppercase font-mono font-bold text-slate-700">{o.payment_mode}</td>
+                    <td className="px-3.5 py-3 text-right font-mono">₹{safeFixed(o.subtotal)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono">₹{safeFixed(o.cgst)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono">₹{safeFixed(o.sgst)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold text-slate-900">₹{safeFixed(o.total)}</td>
+                  </tr>
+                ))}
+                {allDetailedRows.length === 0 && (
+                  <tr>
+                    <td colSpan="9" className="text-center text-muted-foreground py-12">
+                      {loading ? "Loading..." : "No orders found"}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+              {allDetailedRows.length > 0 && (
+                <tfoot className="sticky bottom-0 z-10 bg-[#FFF5EA] border-t-2 border-[#FF8A3D]">
+                  <tr>
+                    <td className="px-3.5 py-3 font-mono font-black text-[#FF6B00]">TOTAL :</td>
+                    <td className="px-3.5 py-3 font-bold text-slate-800">{allDetailedRows.length} Bills</td>
+                    <td className="px-3.5 py-3"></td>
+                    <td className="px-3.5 py-3 text-right font-mono font-black">{dailyTotals.itemsQty}</td>
+                    <td className="px-3.5 py-3"></td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold">₹{safeFixed(dailyTotals.totalSales)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold">₹{safeFixed(dailyTotals.sgstAmount)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-bold">₹{safeFixed(dailyTotals.cgstAmount)}</td>
+                    <td className="px-3.5 py-3 text-right font-mono font-black text-[#FF6B00] text-base">₹{safeFixed(dailyTotals.grossSales)}</td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          )}
+
+          {/* TAB 2: PRODUCTS REPORT (With Unit Rate, Qty Sold, and Total Amount) */}
+          {tab === "products" && (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-bold tracking-[0.14em]">
+                <tr>
+                  <th className="text-left px-4 py-3">SR NO</th>
+                  <th className="text-left px-4 py-3">{t("item") || "ITEM NAME"}</th>
+                  <th className="text-right px-4 py-3">RATE / UNIT PRICE (₹)</th>
+                  <th className="text-right px-4 py-3">{t("qty_sold") || "QTY SOLD"}</th>
+                  <th className="text-right px-4 py-3">TOTAL AMOUNT (₹)</th>
                 </tr>
               </thead>
               <tbody data-testid="products-table">
                 {productRows.map((it, i) => (
                   <tr key={it.name} className="border-t border-[#F4E6D7] hover:bg-[#FFF8F2]">
                     <td className="px-4 py-3 font-mono text-muted-foreground">{i + 1}</td>
-                    <td className="px-4 py-3 font-medium">{t(it.name)}</td>
-                    <td className="px-4 py-3 text-right font-mono">{safeNumber(it.qty)}</td>
-                    <td className="px-4 py-3 text-right font-mono font-semibold">₹{safeFixed(it.revenue)}</td>
+                    <td className="px-4 py-3 font-semibold text-slate-900">{t(it.name)}</td>
+                    <td className="px-4 py-3 text-right font-mono font-semibold text-slate-700">₹{safeFixed(it.rate)}</td>
+                    <td className="px-4 py-3 text-right font-mono font-bold text-slate-900">{safeNumber(it.qty)}</td>
+                    <td className="px-4 py-3 text-right font-mono font-black text-slate-900">₹{safeFixed(it.revenue)}</td>
                   </tr>
                 ))}
-                {productRows.length === 0 && <tr><td colSpan="4" className="text-center text-muted-foreground py-10">{t("no_items_sold") || "No items sold"}</td></tr>}
+                {productRows.length === 0 && (
+                  <tr>
+                    <td colSpan="5" className="text-center text-muted-foreground py-12">
+                      {loading ? "Loading..." : t("no_items_sold") || "No items sold"}
+                    </td>
+                  </tr>
+                )}
               </tbody>
               {productRows.length > 0 && (
-                <tfoot className="sticky bottom-0 z-10 bg-[#FFF5EA] border-t-2 border-b-2 border-[#FF8A3D] shadow-[0_-4px_12px_rgba(0,0,0,0.06)]" data-testid="products-total-row">
+                <tfoot className="sticky bottom-0 z-10 bg-[#FFF5EA] border-t-2 border-b-2 border-[#FF8A3D]" data-testid="products-total-row">
                   <tr className="border-t-2 border-b-2 border-[#FF8A3D]">
                     <td className="px-4 py-3.5 font-mono font-black tracking-wider text-[#FF6B00] text-sm">TOTAL :</td>
-                    <td className="px-4 py-3.5 text-xs font-bold text-slate-800">{productTotals.count} {productTotals.count === 1 ? (t("item") || "Item") : (t("items") || "Items")}</td>
-                    <td className="px-4 py-3.5 text-right font-mono font-bold text-slate-900">{safeNumber(productTotals.qty)}</td>
+                    <td className="px-4 py-3.5 text-xs font-bold text-slate-800">
+                      {productTotals.count} {productTotals.count === 1 ? t("item") || "Item" : t("items") || "Items"}
+                    </td>
+                    <td className="px-4 py-3.5 text-right font-mono text-slate-400">—</td>
+                    <td className="px-4 py-3.5 text-right font-mono font-black text-slate-900 text-sm">{safeNumber(productTotals.qty)}</td>
                     <td className="px-4 py-3.5 text-right font-mono font-black text-[#FF6B00] text-base">₹{safeFixed(productTotals.revenue)}</td>
                   </tr>
                 </tfoot>
@@ -519,46 +1214,61 @@ export default function Reports() {
             </table>
           )}
 
+          {/* TAB 3: THALIS REPORT */}
           {tab === "thalis" && (
             <div>
-              <table className="w-full text-sm">
-                <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-semibold tracking-[0.18em]">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 z-10 text-white bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-[11px] uppercase font-bold tracking-[0.14em]">
                   <tr>
-                    <th className="text-left px-4 py-3">Sr.</th>
-                    <th className="text-left px-4 py-3">{t("thali") || "Thali"}</th>
-                    <th className="text-right px-4 py-3">{t("qty_sold") || "Qty Sold"}</th>
-                    <th className="text-right px-4 py-3">{t("revenue") || "Revenue"}</th>
+                    <th className="text-left px-4 py-3">SR NO</th>
+                    <th className="text-left px-4 py-3">{t("thali") || "THALI NAME"}</th>
+                    <th className="text-right px-4 py-3">RATE / UNIT PRICE (₹)</th>
+                    <th className="text-right px-4 py-3">{t("qty_sold") || "QTY SOLD"}</th>
+                    <th className="text-right px-4 py-3">TOTAL AMOUNT (₹)</th>
                   </tr>
                 </thead>
                 <tbody data-testid="thalis-table">
                   {thaliRows.map((it, i) => (
-                    <tr key={it.name} className="border-t border-border hover:bg-[#FFF8F2]">
+                    <tr key={it.name} className="border-t border-[#F4E6D7] hover:bg-[#FFF8F2]">
                       <td className="px-4 py-3 font-mono text-muted-foreground">{i + 1}</td>
-                      <td className="px-4 py-3 font-medium">{t(it.name)}</td>
-                      <td className="px-4 py-3 text-right font-mono">{safeNumber(it.qty)}</td>
-                      <td className="px-4 py-3 text-right font-mono font-semibold">₹{safeFixed(it.revenue)}</td>
+                      <td className="px-4 py-3 font-semibold text-slate-900">{t(it.name)}</td>
+                      <td className="px-4 py-3 text-right font-mono font-semibold text-slate-700">₹{safeFixed(it.rate)}</td>
+                      <td className="px-4 py-3 text-right font-mono font-bold text-slate-900">{safeNumber(it.qty)}</td>
+                      <td className="px-4 py-3 text-right font-mono font-black text-slate-900">₹{safeFixed(it.revenue)}</td>
                     </tr>
                   ))}
-                  {thaliRows.length === 0 && <tr><td colSpan="4" className="text-center text-muted-foreground py-10">{t("no_thalis_sold") || "No thalis sold"}</td></tr>}
+                  {thaliRows.length === 0 && (
+                    <tr>
+                      <td colSpan="5" className="text-center text-muted-foreground py-12">
+                        {loading ? "Loading..." : t("no_thalis_sold") || "No thalis sold"}
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
                 {thaliRows.length > 0 && (
-                  <tfoot className="sticky bottom-0 z-10 bg-[#FFF5EA] border-t-2 border-b-2 border-[#FF8A3D] shadow-[0_-4px_12px_rgba(0,0,0,0.06)]" data-testid="thalis-total-row">
+                  <tfoot className="sticky bottom-0 z-10 bg-[#FFF5EA] border-t-2 border-b-2 border-[#FF8A3D]" data-testid="thalis-total-row">
                     <tr className="border-t-2 border-b-2 border-[#FF8A3D]">
                       <td className="px-4 py-3.5 font-mono font-black tracking-wider text-[#FF6B00] text-sm">TOTAL :</td>
-                      <td className="px-4 py-3.5 text-xs font-bold text-slate-800">{thaliTotals.count} {thaliTotals.count === 1 ? (t("thali") || "Thali") : (t("thalis") || "Thalis")}</td>
-                      <td className="px-4 py-3.5 text-right font-mono font-bold text-slate-900">{safeNumber(thaliTotals.qty)}</td>
+                      <td className="px-4 py-3.5 text-xs font-bold text-slate-800">
+                        {thaliTotals.count} {thaliTotals.count === 1 ? t("thali") || "Thali" : t("thalis") || "Thalis"}
+                      </td>
+                      <td className="px-4 py-3.5 text-right font-mono text-slate-400">—</td>
+                      <td className="px-4 py-3.5 text-right font-mono font-black text-slate-900 text-sm">{safeNumber(thaliTotals.qty)}</td>
                       <td className="px-4 py-3.5 text-right font-mono font-black text-[#FF6B00] text-base">₹{safeFixed(thaliTotals.revenue)}</td>
                     </tr>
                   </tfoot>
                 )}
               </table>
+
               {thaliPicks.length > 0 && (
-                <div className="p-4 border-t border-border bg-sand-subtle">
-                  <div className="text-[10px] uppercase tracking-[0.25em] text-muted-foreground mb-2 font-semibold">{t("popular_thali_selections") || "Popular Thali Selections"}</div>
+                <div className="p-4 border-t border-[#F4E6D7] bg-[#FFF8F2]">
+                  <div className="text-[10px] uppercase tracking-[0.25em] text-slate-500 mb-2.5 font-bold">
+                    {t("popular_thali_selections") || "Popular Thali Selections"}
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     {thaliPicks.slice(0, 20).map((p) => (
-                      <span key={p.name} className="text-xs px-2.5 py-1 rounded-md bg-white border border-border">
-                        {t(p.name)} <span className="font-mono text-muted-foreground">×{p.qty}</span>
+                      <span key={p.name} className="text-xs px-2.5 py-1 rounded-md bg-white border border-[#F4D8C4] shadow-2xs">
+                        {t(p.name)} <span className="font-mono text-[#FF6B00] font-bold">×{p.qty}</span>
                       </span>
                     ))}
                   </div>
@@ -568,76 +1278,15 @@ export default function Reports() {
           )}
         </div>
 
-        {tab === "sales" && salesRows.length > 0 && (
-          <div className="border-t border-[#F4E6D7] bg-[#FFF8F2] px-5 py-3 flex flex-wrap items-center justify-between gap-4 select-none" data-testid="aggregate-summary-bar">
-            <div className="flex items-center gap-5 flex-wrap">
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Total Bills:</span>
-                <span className="text-base font-black text-slate-900 font-mono">{salesTotals.count}</span>
-              </div>
-              <div className="h-4 w-px bg-[#F4E6D7] hidden sm:block" />
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Taxable Subtotal:</span>
-                <span className="text-sm font-bold text-slate-900 font-mono">₹{safeFixed(salesTotals.subtotal)}</span>
-              </div>
-              <div className="h-4 w-px bg-[#F4E6D7] hidden sm:block" />
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Total Tax:</span>
-                <span className="text-sm font-bold text-slate-900 font-mono">₹{safeFixed(salesTotals.tax)} <span className="text-[10px] text-slate-500 font-normal">(CGST: ₹{safeFixed(salesTotals.cgst)} + SGST: ₹{safeFixed(salesTotals.sgst)})</span></span>
-              </div>
-              <div className="h-4 w-px bg-[#F4E6D7] hidden md:block" />
-              <div className="flex items-center gap-2 text-xs">
-                <span className="px-2 py-0.5 rounded-md bg-white border border-[#F4E6D7] font-semibold text-slate-700">Cash: <strong className="font-mono text-slate-900">₹{safeFixed(salesTotals.cash)}</strong></span>
-                <span className="px-2 py-0.5 rounded-md bg-white border border-[#F4E6D7] font-semibold text-slate-700">UPI: <strong className="font-mono text-slate-900">₹{safeFixed(salesTotals.upi)}</strong></span>
-                {salesTotals.card > 0 && <span className="px-2 py-0.5 rounded-md bg-white border border-[#F4E6D7] font-semibold text-slate-700">Card: <strong className="font-mono text-slate-900">₹{safeFixed(salesTotals.card)}</strong></span>}
-              </div>
-            </div>
-            <div className="flex items-baseline gap-2 bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white px-3.5 py-1.5 rounded-xl shadow-sm">
-              <span className="text-xs font-bold uppercase tracking-wider">Total Amount Collected:</span>
-              <span className="text-lg font-black font-mono tracking-tight">₹{safeFixed(salesTotals.total)}</span>
-            </div>
+        {/* Bottom PDF-Style Print Status & Info Bar */}
+        <div className="border-t border-[#F4E6D7] bg-[#FFF8F2] px-5 py-2.5 flex flex-wrap items-center justify-between text-[11px] text-slate-500 font-mono select-none">
+          <div>
+            Print on <span className="font-semibold text-slate-800">{printTimestamp}</span> By <span className="font-semibold text-slate-800">{cashierDisplayName}</span>
           </div>
-        )}
-
-        {tab === "products" && productRows.length > 0 && (
-          <div className="border-t border-[#F4E6D7] bg-[#FFF8F2] px-5 py-3 flex flex-wrap items-center justify-between gap-4 select-none" data-testid="aggregate-summary-bar">
-            <div className="flex items-center gap-5 flex-wrap">
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Total Items:</span>
-                <span className="text-base font-black text-slate-900 font-mono">{productTotals.count}</span>
-              </div>
-              <div className="h-4 w-px bg-[#F4E6D7] hidden sm:block" />
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Total Qty Sold:</span>
-                <span className="text-sm font-bold text-slate-900 font-mono">{safeNumber(productTotals.qty)}</span>
-              </div>
-            </div>
-            <div className="flex items-baseline gap-2 bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white px-3.5 py-1.5 rounded-xl shadow-sm">
-              <span className="text-xs font-bold uppercase tracking-wider">Total Revenue:</span>
-              <span className="text-lg font-black font-mono tracking-tight">₹{safeFixed(productTotals.revenue)}</span>
-            </div>
+          <div>
+            Page No <span className="font-semibold text-slate-800">1</span> Of <span className="font-semibold text-slate-800">1</span>
           </div>
-        )}
-
-        {tab === "thalis" && thaliRows.length > 0 && (
-          <div className="border-t border-[#F4E6D7] bg-[#FFF8F2] px-5 py-3 flex flex-wrap items-center justify-between gap-4 select-none" data-testid="aggregate-summary-bar">
-            <div className="flex items-center gap-5 flex-wrap">
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Total Thalis:</span>
-                <span className="text-base font-black text-slate-900 font-mono">{thaliTotals.count}</span>
-              </div>
-              <div className="h-4 w-px bg-[#F4E6D7] hidden sm:block" />
-              <div className="flex items-baseline gap-1.5">
-                <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500">Total Qty Sold:</span>
-                <span className="text-sm font-bold text-slate-900 font-mono">{safeNumber(thaliTotals.qty)}</span>
-              </div>
-            </div>
-            <div className="flex items-baseline gap-2 bg-gradient-to-r from-[#FF8A3D] to-[#FF6B00] text-white px-3.5 py-1.5 rounded-xl shadow-sm">
-              <span className="text-xs font-bold uppercase tracking-wider">Total Revenue:</span>
-              <span className="text-lg font-black font-mono tracking-tight">₹{safeFixed(thaliTotals.revenue)}</span>
-            </div>
-          </div>
-        )}
+        </div>
       </Card>
     </div>
   );
