@@ -73,6 +73,8 @@
   },
   "scripts": {
     "start": "craco start",
+    "dev:backend": "python ../backend/server.py",
+    "dev:all": "concurrently -k -n \"BACKEND,FRONTEND\" -c \"cyan,magenta\" \"python ../backend/server.py\" \"craco start\"",
     "build": "craco build",
     "test": "craco test",
     "electron:dev": "concurrently -k \"set BROWSER=none&& npm start\" \"wait-on http://localhost:3000 && set ELECTRON_DEV=true&& electron ../electron/main.js\"",

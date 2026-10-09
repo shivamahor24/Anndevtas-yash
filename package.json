@@ -4,8 +4,9 @@
   "private": true,
   "description": "Root workspace workspace runner for Anndevta POS",
   "scripts": {
-    "dev": "npm --prefix frontend run electron:dev",
-    "start": "npm --prefix frontend run start",
+    "dev": "npm --prefix frontend run dev:all",
+    "start": "npm --prefix frontend run dev:all",
+    "desktop": "npm --prefix frontend run electron:dev",
     "build": "npm --prefix frontend run build",
     "electron:dev": "npm --prefix frontend run electron:dev",
     "electron:build": "npm --prefix frontend run electron:build",

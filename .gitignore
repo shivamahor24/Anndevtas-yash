@@ -55,6 +55,7 @@ venv/
 .venv/
 venv_win/
 *.db
+*.bak
 backend/build/
 
 # Development tools
@@ -112,9 +113,4 @@ FIX_LOGIN_ERROR.bat
 DIAGNOSE_ISSUE.bat
 
 # Temporary documentation (build-related)
-COMPLETE_WORKFLOW.md
-FINAL_BUILD_GUIDE.md
-DIRECT_PRINTING_IMPLEMENTATION.md
-PROJECT_STRUCTURE.md
-TESTING_CHECKLIST.md
-TROUBLESHOOTING.md
+*.md
