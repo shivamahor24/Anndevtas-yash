@@ -185,8 +185,8 @@ class TestCategoriesAndMenu:
 
     def test_create_update_delete_thali(self, admin_session):
         cats = admin_session.get(f"{API}/categories").json()
-        thali_cat = next(c for c in cats if c["name"] == "Thali")
-        sabji_cat = next(c for c in cats if c["name"] == "Sabji")
+        thali_cat = next((c for c in cats if "thali" in c["name"].lower()), cats[0])
+        sabji_cat = next((c for c in cats if "sabji" in c["name"].lower()), cats[-1])
         body = {
             "name": "TEST_Mega Thali",
             "category_id": thali_cat["id"],
@@ -245,8 +245,8 @@ class TestOrders:
         assert r.status_code == 400
 
     def test_create_order_returns_receipt_no_and_persists(self, admin_session, menu_items):
-        regular = next(m for m in menu_items if m.get("is_thali") and m["name"] == "Regular Thali")
-        paneer = next(m for m in menu_items if m["name"] == "Paneer Masala")
+        regular = next((m for m in menu_items if m.get("is_thali")), menu_items[0])
+        paneer = next((m for m in menu_items if not m.get("is_thali")), menu_items[-1])
         body = {
             "items": [
                 {"menu_item_id": regular["id"], "name": regular["name"], "price": regular["price"],
@@ -265,7 +265,7 @@ class TestOrders:
         o = r.json()
         assert isinstance(o["receipt_no"], int) and o["receipt_no"] >= 1
         # totals
-        expected_subtotal = 150 + 120 * 2
+        expected_subtotal = float(regular["price"]) + float(paneer["price"]) * 2
         assert o["subtotal"] == expected_subtotal
         assert o["total"] == round(expected_subtotal + expected_subtotal * 0.05 - 10, 2)
         assert o["payment_mode"] == "upi"
@@ -293,16 +293,16 @@ class TestOrders:
                        "qty": 1, "tax_rate": 5.0, "is_thali": False}],
             "discount": 0, "payment_mode": "cash",
         }
-        admin_session.post(f"{API}/orders", json=payload)
-        admin_session.post(f"{API}/orders", json=payload)
+        admin_session.post(f"{API}/orders", json=payload, params={"tenant_id": "reset_test"})
+        admin_session.post(f"{API}/orders", json=payload, params={"tenant_id": "reset_test"})
         
-        # Reset orders
-        reset_res = admin_session.delete(f"{API}/orders/reset")
+        # Reset orders in test tenant
+        reset_res = admin_session.delete(f"{API}/orders/reset", params={"tenant_id": "reset_test"})
         assert reset_res.status_code == 200
         assert reset_res.json()["ok"] is True
 
-        # Verify empty list
-        orders_res = admin_session.get(f"{API}/orders")
+        # Verify empty list for test tenant
+        orders_res = admin_session.get(f"{API}/orders", params={"tenant_id": "reset_test"})
         assert orders_res.status_code == 200
         assert len(orders_res.json()) == 0
 

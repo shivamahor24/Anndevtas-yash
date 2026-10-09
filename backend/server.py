@@ -40,18 +40,40 @@ import aiosqlite
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal, Dict, Any
 
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, Body
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from openpyxl import Workbook  # type: ignore
 
 
+import asyncio
+import sqlite3
 from contextvars import ContextVar
 
-# ------- SQLite -------
-DB_PATH = os.environ.get('DB_PATH', str(ROOT_DIR / 'pos_data.db'))
+# ------- SQLite Canonical Path Resolution -------
+def resolve_canonical_db_path() -> str:
+    raw = os.environ.get('DB_PATH', 'pos_data.db')
+    if raw == ':memory:':
+        return ':memory:'
+    p = Path(raw)
+    if not p.is_absolute():
+        # Always resolve relative paths deterministically against ROOT_DIR (backend/)
+        p = (ROOT_DIR / p).resolve()
+    else:
+        p = p.resolve()
+    return str(p)
+
+DB_PATH = resolve_canonical_db_path()
 default_db_name = os.environ.get('DB_NAME', 'pos')
+
+# Tenant-level receipt allocation locks for strict sequential concurrency safety
+_receipt_alloc_locks: Dict[str, asyncio.Lock] = {}
+
+def _get_tenant_receipt_lock(tenant: str) -> asyncio.Lock:
+    if tenant not in _receipt_alloc_locks:
+        _receipt_alloc_locks[tenant] = asyncio.Lock()
+    return _receipt_alloc_locks[tenant]
 
 # Tenant context — stores the tenant_id string for multi-tenant isolation
 tenant_id_ctx: ContextVar[str] = ContextVar("tenant_id_ctx", default="default")
@@ -307,6 +329,19 @@ class OrderIn(BaseModel):
     order_type: Optional[str] = "dining"
     customer_name: Optional[str] = ""
     customer_phone: Optional[str] = ""
+    is_deleted: Optional[bool] = False
+    deleted_at: Optional[str] = None
+    deleted_by: Optional[str] = None
+    deletion_reason: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+class OrderDeleteIn(BaseModel):
+    reason: Optional[str] = None
+    deletion_reason: Optional[str] = None
+    deleted_by: Optional[str] = None
 
     class Config:
         extra = "allow"
@@ -531,6 +566,7 @@ async def _create_tables(db: aiosqlite.Connection):
             id TEXT NOT NULL,
             tenant_db TEXT NOT NULL DEFAULT 'default',
             receipt_no INTEGER,
+            receipt_governed INTEGER NOT NULL DEFAULT 0,
             items TEXT NOT NULL DEFAULT '[]',
             subtotal REAL NOT NULL DEFAULT 0,
             tax REAL NOT NULL DEFAULT 0,
@@ -544,6 +580,12 @@ async def _create_tables(db: aiosqlite.Connection):
             cashier_name TEXT DEFAULT '',
             token_no INTEGER DEFAULT NULL,
             order_type TEXT DEFAULT 'dining',
+            customer_name TEXT DEFAULT '',
+            customer_phone TEXT DEFAULT '',
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT DEFAULT NULL,
+            deleted_by TEXT DEFAULT NULL,
+            deletion_reason TEXT DEFAULT '',
             PRIMARY KEY (id, tenant_db)
         );
 
@@ -822,6 +864,11 @@ async def _create_tables(db: aiosqlite.Connection):
         "ALTER TABLE orders ADD COLUMN order_type TEXT DEFAULT 'dining'",
         "ALTER TABLE orders ADD COLUMN customer_name TEXT DEFAULT ''",
         "ALTER TABLE orders ADD COLUMN customer_phone TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN deleted_at TEXT DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN deleted_by TEXT DEFAULT NULL",
+        "ALTER TABLE orders ADD COLUMN deletion_reason TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN receipt_governed INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE menu ADD COLUMN gst_enabled INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE menu ADD COLUMN item_gst_rate REAL NOT NULL DEFAULT 0.0",
         "ALTER TABLE menu ADD COLUMN current_stock REAL DEFAULT NULL",
@@ -840,13 +887,34 @@ async def _create_tables(db: aiosqlite.Connection):
         except Exception:
             pass
 
+    # Post-migration indexes on newly added columns
+    post_migration_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_orders_deleted ON orders(tenant_db, is_deleted)",
+        # CRITICAL UNCONDITIONAL INTEGRITY: For all newly governed orders, enforce strict uniqueness at the SQLite engine level!
+        # Historical grandfathered records (receipt_governed = 0) are preserved without failing migration.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_governed_receipt ON orders(tenant_db, receipt_no) WHERE receipt_governed = 1",
+    ]
+    for idx_stmt in post_migration_indexes:
+        try:
+            await db.execute(idx_stmt)
+            await db.commit()
+        except Exception:
+            pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _db_conn
-    db_file = Path(DB_PATH)
-    db_file.parent.mkdir(parents=True, exist_ok=True)
-    _db_conn = await aiosqlite.connect(str(db_file), timeout=60.0)
+    db_path_str = resolve_canonical_db_path()
+    logger.info(f"[DATABASE] Authoritative Canonical DB Path: {db_path_str}")
+    print(f"[DATABASE] Authoritative Canonical DB Path: {db_path_str}", flush=True)
+
+    if db_path_str != ':memory:':
+        db_file = Path(db_path_str)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        _db_conn = await aiosqlite.connect(str(db_file), timeout=60.0)
+    else:
+        _db_conn = await aiosqlite.connect(':memory:', timeout=60.0)
     _db_conn.row_factory = None  # We use our own row-to-dict conversion
     try:
         # Use DELETE journal mode (not WAL) so there are no .wal/.shm side files
@@ -856,6 +924,20 @@ async def lifespan(app: FastAPI):
         await _db_conn.execute("PRAGMA foreign_keys=ON")
         await _create_tables(_db_conn)
         await seed_defaults()
+
+        # Align counters to MAX(receipt_no) across existing orders to guarantee strict sequence monotonicity
+        try:
+            m_res = await _fetchone(_db_conn, "SELECT MAX(receipt_no) as max_rn FROM orders")
+            if m_res and m_res.get("max_rn") is not None:
+                max_rn = int(m_res["max_rn"])
+                c_res = await _fetchone(_db_conn, "SELECT value FROM counters WHERE id = 'receipt' AND tenant_db = 'default'")
+                if c_res:
+                    if int(c_res.get("value", 0)) < max_rn:
+                        await _execute(_db_conn, "UPDATE counters SET value = ? WHERE id = 'receipt' AND tenant_db = 'default'", (max_rn,))
+                else:
+                    await _execute(_db_conn, "INSERT INTO counters (id, tenant_db, value) VALUES ('receipt', 'default', ?)", (max_rn,))
+        except Exception as align_err:
+            logger.warning(f"Could not align receipt counter: {align_err}")
     except Exception as e:
         logger.warning(f"Lifespan database setup warning: {e}")
 
@@ -1630,16 +1712,16 @@ def _compute_totals(items: list, discount: float, default_cgst_rate: float = 2.5
 async def _next_receipt_number() -> int:
     db = await get_db()
     tenant = _tenant()
-    row = await _fetchone(db, "SELECT value FROM counters WHERE id = ? AND tenant_db = ?", ("receipt", tenant))
-    if row:
-        new_val = int(row["value"]) + 1
-        await _execute(db, "UPDATE counters SET value = ? WHERE id = ? AND tenant_db = ?", (new_val, "receipt", tenant))
-        return new_val
-    else:
+    async with _get_tenant_receipt_lock(tenant):
+        row = await _fetchone(db, "SELECT value FROM counters WHERE id = ? AND tenant_db = ?", ("receipt", tenant))
         max_order = await _fetchone(db, "SELECT MAX(receipt_no) as max_rn FROM orders WHERE tenant_db = ?", (tenant,))
         max_rn = int(max_order["max_rn"]) if max_order and max_order["max_rn"] is not None else 0
-        new_val = max_rn + 1
-        await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, new_val))
+        cur_val = int(row["value"]) if row and row.get("value") is not None else 0
+        new_val = max(cur_val, max_rn) + 1
+        if row:
+            await _execute(db, "UPDATE counters SET value = ? WHERE id = ? AND tenant_db = ?", (new_val, "receipt", tenant))
+        else:
+            await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, new_val))
         return new_val
 
 
@@ -1668,29 +1750,43 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
 
     order_type = (body.order_type or "dining").lower()
     totals = _compute_totals(items, body.discount, default_cgst, default_sgst, order_type)
-    
-    # Bill number determination (sequential, starting at 1, no 1000-series)
-    client_rn = body.receipt_no or body.bill_number
-    if client_rn is not None and int(client_rn) > 0:
-        rn = int(client_rn)
-        if 1001 <= rn < 2000:
-            rn = rn - 1000
-        # Sync the server counter so subsequent orders don't clash
-        row = await _fetchone(db, "SELECT value FROM counters WHERE id = ? AND tenant_db = ?", ("receipt", tenant))
-        if row:
-            cur_val = int(row["value"])
-            if rn > cur_val:
-                await _execute(db, "UPDATE counters SET value = ? WHERE id = ? AND tenant_db = ?", (rn, "receipt", tenant))
-        else:
-            await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, rn))
-    else:
-        rn = await _next_receipt_number()
 
     order_id = str(body.id).strip() if (getattr(body, "id", None) and str(body.id).strip()) else new_id()
     ts = iso(now_utc())
+
+    is_del_val = 1 if getattr(body, "is_deleted", False) else 0
+    del_at_val = getattr(body, "deleted_at", None)
+    del_by_val = getattr(body, "deleted_by", None)
+    del_reason_val = getattr(body, "deletion_reason", "") or ""
+
+    # --- 1. IDEMPOTENCY / RETRY CHECK ---
+    # Distinct Order Identity from Business Sequence: if this immutable order ID already exists,
+    # return the existing record without generating a duplicate or wasting sequence numbers.
+    existing = await _fetchone(db, "SELECT * FROM orders WHERE id = ? AND tenant_db = ?", (order_id, tenant))
+    if existing:
+        existing_rn = existing.get("receipt_no")
+        await _execute(db,
+            """UPDATE orders SET items = ?, subtotal = ?, tax = ?, discount = ?, total = ?,
+               payment_mode = ?, notes = ?, token_no = ?, order_type = ?, customer_name = ?, customer_phone = ?,
+               is_deleted = ?, deleted_at = ?, deleted_by = ?, deletion_reason = ?
+               WHERE id = ? AND tenant_db = ?""",
+            (_to_json(items), totals["subtotal"], totals["tax"], body.discount, totals["total"],
+             body.payment_mode, body.notes, body.token_no, order_type,
+             getattr(body, "customer_name", "") or "", getattr(body, "customer_phone", "") or "",
+             is_del_val if is_del_val else existing.get("is_deleted", 0),
+             del_at_val, del_by_val, del_reason_val, existing["id"], tenant))
+        res = dict(existing)
+        res["items"] = items
+        res["subtotal"] = totals["subtotal"]
+        res["tax"] = totals["tax"]
+        res["total"] = totals["total"]
+        res["receipt_no"] = existing_rn
+        res["bill_number"] = existing_rn
+        return res
+
     order = {
         "id": order_id,
-        "receipt_no": rn,
+        "receipt_no": 0,
         "items": items,
         "subtotal": totals["subtotal"],
         "cgst": totals["cgst"],
@@ -1710,29 +1806,80 @@ async def create_order(body: OrderIn, user: dict = Depends(get_current_user)):
         "cashier_name": user.get("name"),
         "token_no": body.token_no,
         "order_type": order_type,
+        "is_deleted": bool(is_del_val),
+        "deleted_at": del_at_val,
+        "deleted_by": del_by_val,
+        "deletion_reason": del_reason_val,
     }
 
-    # Deduplication: Check if order already exists by id
-    existing = await _fetchone(db, "SELECT id FROM orders WHERE id = ? AND tenant_db = ?", (order_id, tenant))
-    if existing:
-        await _execute(db,
-            """UPDATE orders SET items = ?, subtotal = ?, tax = ?, discount = ?, total = ?,
-               payment_mode = ?, notes = ?, token_no = ?, order_type = ?, customer_name = ?, customer_phone = ?
-               WHERE id = ? AND tenant_db = ?""",
-            (_to_json(order["items"]), order["subtotal"], order["tax"], order["discount"], order["total"],
-             order["payment_mode"], order["notes"], order["token_no"], order["order_type"],
-             order["customer_name"], order["customer_phone"], existing["id"], tenant))
-        order["id"] = existing["id"]
-        return order
+    # --- 2. ATOMIC NUMBER ALLOCATION & INSERTION ---
+    # Serialized per tenant to guarantee zero race condition under concurrency.
+    async with _get_tenant_receipt_lock(tenant):
+        # Re-check existence in case of parallel race on identical ID
+        existing_in_lock = await _fetchone(db, "SELECT * FROM orders WHERE id = ? AND tenant_db = ?", (order_id, tenant))
+        if existing_in_lock:
+            res = dict(existing_in_lock)
+            res["receipt_no"] = existing_in_lock.get("receipt_no")
+            res["bill_number"] = existing_in_lock.get("receipt_no")
+            return res
 
-    await _execute(db,
-        """INSERT INTO orders (id, tenant_db, receipt_no, items, subtotal, tax, discount, total, payment_mode, notes,
-           created_at, paid_at, cashier_email, cashier_name, token_no, order_type)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (order["id"], tenant, order["receipt_no"], _to_json(order["items"]),
-         order["subtotal"], order["tax"], order["discount"], order["total"],
-         order["payment_mode"], order["notes"], order["created_at"], order["paid_at"],
-         order["cashier_email"], order["cashier_name"], order["token_no"], order["order_type"]))
+        # High watermark baseline from both counters and orders tables
+        c_row = await _fetchone(db, "SELECT value FROM counters WHERE id = ? AND tenant_db = ?", ("receipt", tenant))
+        cur_counter = int(c_row["value"]) if c_row and c_row.get("value") is not None else 0
+
+        max_o = await _fetchone(db, "SELECT MAX(receipt_no) as max_rn FROM orders WHERE tenant_db = ?", (tenant,))
+        cur_max_order = int(max_o["max_rn"]) if max_o and max_o.get("max_rn") is not None else 0
+
+        baseline = max(cur_counter, cur_max_order)
+
+        # Check client proposal: NEVER allow client to claim an already taken receipt_no or overwrite another order
+        client_rn = body.receipt_no or body.bill_number
+        rn = None
+        if client_rn is not None and int(client_rn) > baseline:
+            colliding = await _fetchone(db, "SELECT 1 FROM orders WHERE receipt_no = ? AND tenant_db = ?", (int(client_rn), tenant))
+            if not colliding:
+                rn = int(client_rn)
+
+        if rn is None:
+            rn = baseline + 1
+
+        # Insert with receipt_governed = 1. Protected by SQLite UNIQUE INDEX uq_orders_governed_receipt
+        max_attempts = 15
+        for attempt in range(max_attempts):
+            try:
+                # Update counter
+                if c_row:
+                    await _execute(db, "UPDATE counters SET value = ? WHERE id = ? AND tenant_db = ?", (rn, "receipt", tenant))
+                else:
+                    await _execute(db, "INSERT INTO counters (id, tenant_db, value) VALUES (?, ?, ?)", ("receipt", tenant, rn))
+                    c_row = {"value": rn}
+
+                await _execute(db,
+                    """INSERT INTO orders (id, tenant_db, receipt_no, receipt_governed, items, subtotal, tax, discount, total, payment_mode, notes,
+                       created_at, paid_at, cashier_email, cashier_name, token_no, order_type, customer_name, customer_phone,
+                       is_deleted, deleted_at, deleted_by, deletion_reason)
+                       VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (order["id"], tenant, rn, _to_json(order["items"]),
+                     order["subtotal"], order["tax"], order["discount"], order["total"],
+                     order["payment_mode"], order["notes"], order["created_at"], order["paid_at"],
+                     order["cashier_email"], order["cashier_name"], order["token_no"], order["order_type"],
+                     order["customer_name"], order["customer_phone"],
+                     is_del_val, del_at_val, del_by_val, del_reason_val))
+                order["receipt_no"] = rn
+                order["bill_number"] = rn
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                if "unique" in err_str and "receipt_no" in err_str:
+                    rn += 1
+                    if attempt == max_attempts - 1:
+                        raise HTTPException(500, f"Failed to allocate unique receipt number: {e}")
+                else:
+                    raise
+
+    # Skip inventory deduction if order is already deleted
+    if is_del_val:
+        return order
 
 
     # --- Inventory hook: decrement stock for each sold item ---
@@ -1792,24 +1939,33 @@ async def list_orders(
     to_date: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = 500,
+    status: Optional[str] = None,
+    include_deleted: bool = False,
     user: dict = Depends(get_current_user),
 ):
     db = await get_db()
     tenant = _tenant()
     conditions = ["tenant_db = ?"]
     params: list = [tenant]
-    
+
     if user.get("role") == "cashier":
         conditions.append("cashier_email = ?")
         params.append(user.get("email"))
-    
+
+    if status == "deleted":
+        conditions.append("is_deleted = 1")
+    elif status == "all" or include_deleted:
+        pass
+    else:
+        conditions.append("COALESCE(is_deleted, 0) = 0")
+
     if from_date:
         conditions.append("paid_at >= ?")
         params.append(from_date)
     if to_date:
         conditions.append("paid_at <= ?")
         params.append(to_date)
-    
+
     if q:
         try:
             rn = int(q)
@@ -1818,17 +1974,18 @@ async def list_orders(
         except ValueError:
             conditions.append("id LIKE ?")
             params.append(f"%{q}%")
-    
+
     where = " AND ".join(conditions)
     params.append(limit)
     rows = await _fetchall(db,
         f"SELECT * FROM orders WHERE {where} ORDER BY paid_at DESC LIMIT ?", params)
-    
+
     seen_ids = set()
     cleaned_rows = []
     for r in rows:
         r["items"] = _parse_json(r.get("items"), [])
         r.pop("tenant_db", None)
+        r["is_deleted"] = bool(r.get("is_deleted", 0))
         oid = r.get("id")
         if oid in seen_ids:
             continue
@@ -1837,8 +1994,6 @@ async def list_orders(
         if rn is not None:
             try:
                 rn_int = int(rn)
-                if 1001 <= rn_int < 2000:
-                    rn_int = rn_int - 1000
                 r["receipt_no"] = rn_int
                 r["bill_number"] = rn_int
             except (ValueError, TypeError):
@@ -1848,61 +2003,199 @@ async def list_orders(
     return cleaned_rows
 
 
+@api.get("/orders/deleted")
+async def list_deleted_orders(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 500,
+    user: dict = Depends(require_roles("admin", "owner")),
+):
+    return await list_orders(
+        from_date=from_date,
+        to_date=to_date,
+        q=q,
+        limit=limit,
+        status="deleted",
+        user=user,
+    )
+
+
 @api.get("/orders/{oid}")
-async def get_order(oid: str, _: dict = Depends(get_current_user)):
+async def get_order(oid: str, include_deleted: bool = False, _: dict = Depends(get_current_user)):
     db = await get_db()
     tenant = _tenant()
-    o = await _fetchone(db, "SELECT * FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    where = "id = ? AND tenant_db = ?"
+    if not include_deleted:
+        where += " AND COALESCE(is_deleted, 0) = 0"
+    o = await _fetchone(db, f"SELECT * FROM orders WHERE {where}", (oid, tenant))
     if not o:
-        raise HTTPException(404, "Not found")
+        raise HTTPException(404, "Order not found")
     o["items"] = _parse_json(o.get("items"), [])
+    o.pop("tenant_db", None)
+    o["is_deleted"] = bool(o.get("is_deleted", 0))
+    rn = o.get("receipt_no")
+    if rn is not None:
+        try:
+            rn_int = int(rn)
+            o["receipt_no"] = rn_int
+            o["bill_number"] = rn_int
+        except (ValueError, TypeError):
+            pass
     return o
 
 
 @api.delete("/orders/reset")
-async def reset_orders_reset_path(_: dict = Depends(get_current_user)):
+async def reset_orders_reset_path(_: dict = Depends(require_roles("admin", "owner"))):
+    """
+    Administrative test & dev database reset utility.
+    Strictly isolated per tenant and restricted to verified admin/owner roles.
+    """
     db = await get_db()
     tenant = _tenant()
-    await _execute(db, "DELETE FROM orders WHERE tenant_db = ?", (tenant,))
-    await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
-    return {"ok": True, "message": "All order records deleted"}
-
-
-@api.delete("/orders")
-async def reset_orders_root_path(_: dict = Depends(get_current_user)):
-    db = await get_db()
-    tenant = _tenant()
-    await _execute(db, "DELETE FROM orders WHERE tenant_db = ?", (tenant,))
-    await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
+    await _execute(db, "DELETE FROM orders WHERE tenant_db = ? AND receipt_governed = 1", (tenant,))
+    # CRITICAL: Do NOT delete receipt counters or regress the sequence back to 0.
+    # The high watermark is strictly preserved so future orders never reuse numbers.
     return {"ok": True, "message": "All order records deleted"}
 
 
 @api.delete("/orders/{oid}")
-async def delete_order(oid: str, user: dict = Depends(get_current_user)):
-    if oid == "reset":
-        return await reset_orders_reset_path(user)
+async def delete_order(
+    oid: str,
+    body: Optional[OrderDeleteIn] = Body(None),
+    user: dict = Depends(require_roles("admin", "owner")),
+):
     db = await get_db()
     tenant = _tenant()
-    order = await _fetchone(db, "SELECT id, receipt_no FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    order = await _fetchone(db, "SELECT * FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    if not order and oid.isdigit():
+        order = await _fetchone(db, "SELECT * FROM orders WHERE receipt_no = ? AND tenant_db = ?", (int(oid), tenant))
     if not order:
         raise HTTPException(404, "Order not found")
-    
-    del_rn = order.get("receipt_no")
-    await _execute(db, "DELETE FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
-    
-    # Resequence: Shift subsequent orders down by 1 so bill numbers remain continuous
-    if del_rn is not None and int(del_rn) > 0:
-        await _execute(db, "UPDATE orders SET receipt_no = receipt_no - 1 WHERE tenant_db = ? AND receipt_no > ?", (tenant, int(del_rn)))
 
-    remaining = await _fetchone(db, "SELECT COUNT(*) as count FROM orders WHERE tenant_db = ?", (tenant,))
-    if remaining and remaining["count"] == 0:
-        await _execute(db, "DELETE FROM counters WHERE id = 'receipt' AND tenant_db = ?", (tenant,))
-    else:
-        max_rn_row = await _fetchone(db, "SELECT MAX(receipt_no) as max_rn FROM orders WHERE tenant_db = ?", (tenant,))
-        new_max = int(max_rn_row["max_rn"]) if max_rn_row and max_rn_row["max_rn"] is not None else 0
-        if new_max > 0:
-            await _execute(db, "UPDATE counters SET value = ? WHERE id = 'receipt' AND tenant_db = ?", (new_max, tenant))
-    return {"ok": True, "id": oid}
+    if order.get("is_deleted"):
+        return {
+            "ok": True,
+            "id": order.get("id", oid),
+            "message": "Order already deleted",
+            "receipt_no": order.get("receipt_no"),
+            "deleted_at": order.get("deleted_at"),
+            "deleted_by": order.get("deleted_by"),
+        }
+
+    reason = "Deleted by owner"
+    if body:
+        if body.reason:
+            reason = body.reason
+        elif body.deletion_reason:
+            reason = body.deletion_reason
+    now_ts = iso(now_utc())
+    deleter = (body.deleted_by if body and body.deleted_by else None) or user.get("name") or user.get("email") or "Admin"
+
+    # Soft delete: update status and record audit trail. Permanent order number is untouched!
+    await _execute(db,
+        """UPDATE orders
+           SET is_deleted = 1, deleted_at = ?, deleted_by = ?, deletion_reason = ?
+           WHERE id = ? AND tenant_db = ?""",
+        (now_ts, deleter, reason, order["id"], tenant))
+
+    # CRITICAL: DO NOT RENUMBER OR SHIFT ANY RECEIPT NUMBERS
+    # CRITICAL: DO NOT ROLL BACK COUNTERS
+
+    return {
+        "ok": True,
+        "id": order["id"],
+        "receipt_no": order.get("receipt_no"),
+        "deleted_at": now_ts,
+        "deleted_by": deleter,
+        "deletion_reason": reason,
+    }
+
+
+@api.post("/orders/{oid}/restore")
+@api.patch("/orders/{oid}/restore")
+async def restore_order(
+    oid: str,
+    user: dict = Depends(require_roles("admin", "owner", "cashier", "manager")),
+):
+    db = await get_db()
+    tenant = _tenant()
+    order = await _fetchone(db, "SELECT * FROM orders WHERE id = ? AND tenant_db = ?", (oid, tenant))
+    if not order and oid.isdigit():
+        order = await _fetchone(db, "SELECT * FROM orders WHERE receipt_no = ? AND tenant_db = ?", (int(oid), tenant))
+    if not order:
+        raise HTTPException(404, "Order not found")
+
+    if not order.get("is_deleted"):
+        return {
+            "ok": True,
+            "id": order["id"],
+            "message": "Order is already active",
+            "receipt_no": order.get("receipt_no"),
+        }
+
+    # Restore order: clear deleted flag and audit fields. Order retains its canonical receipt_no!
+    await _execute(db,
+        """UPDATE orders
+           SET is_deleted = 0, deleted_at = NULL, deleted_by = NULL, deletion_reason = NULL
+           WHERE id = ? AND tenant_db = ?""",
+        (order["id"], tenant))
+
+    return {
+        "ok": True,
+        "id": order["id"],
+        "receipt_no": order.get("receipt_no"),
+        "message": f"Order #{order.get('receipt_no')} restored successfully",
+    }
+
+
+@api.post("/orders/delete-all")
+async def delete_all_orders(
+    body: Optional[OrderDeleteIn] = Body(None),
+    user: dict = Depends(require_roles("admin", "owner", "cashier", "manager")),
+):
+    db = await get_db()
+    tenant = _tenant()
+    reason = "Bulk delete by user"
+    if body:
+        if body.reason:
+            reason = body.reason
+        elif body.deletion_reason:
+            reason = body.deletion_reason
+    now_ts = iso(now_utc())
+    deleter = (body.deleted_by if body and body.deleted_by else None) or user.get("name") or user.get("email") or "Admin"
+
+    await _execute(db,
+        """UPDATE orders
+           SET is_deleted = 1, deleted_at = ?, deleted_by = ?, deletion_reason = ?
+           WHERE tenant_db = ? AND (is_deleted = 0 OR is_deleted IS NULL)""",
+        (now_ts, deleter, reason, tenant))
+
+    return {
+        "ok": True,
+        "message": "All active orders moved to deleted orders",
+        "deleted_at": now_ts,
+        "deleted_by": deleter,
+    }
+
+
+@api.post("/orders/restore-all")
+async def restore_all_orders(
+    user: dict = Depends(require_roles("admin", "owner", "cashier", "manager")),
+):
+    db = await get_db()
+    tenant = _tenant()
+
+    await _execute(db,
+        """UPDATE orders
+           SET is_deleted = 0, deleted_at = NULL, deleted_by = NULL, deletion_reason = NULL
+           WHERE tenant_db = ? AND is_deleted = 1""",
+        (tenant,))
+
+    return {
+        "ok": True,
+        "message": "All deleted orders restored successfully",
+    }
 
 
 # ------- Dashboard -------
@@ -1923,7 +2216,7 @@ async def _orders_in_range(start_iso: str, end_iso: str) -> list:
     db = await get_db()
     tenant = _tenant()
     rows = await _fetchall(db,
-        "SELECT * FROM orders WHERE tenant_db = ? ORDER BY paid_at ASC",
+        "SELECT * FROM orders WHERE tenant_db = ? AND COALESCE(is_deleted, 0) = 0 ORDER BY paid_at ASC",
         (tenant,))
     s_day = (start_iso or "")[:10]
     e_day = (end_iso or "")[:10]
@@ -3799,7 +4092,7 @@ async def ai_chat(body: ChatMessage, user: dict = Depends(get_current_user)):
     today_str = today.isoformat()
     
     orders = await _fetchall(db,
-        "SELECT total FROM orders WHERE tenant_db = ? AND created_at >= ?",
+        "SELECT total FROM orders WHERE tenant_db = ? AND COALESCE(is_deleted, 0) = 0 AND created_at >= ?",
         (tenant, today_str))
     total_sales = sum(o.get("total", 0) for o in orders)
     
