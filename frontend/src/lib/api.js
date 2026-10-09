@@ -47,7 +47,23 @@ const TOKEN_KEY = "pos_token";
 const REFRESH_KEY = "pos_refresh_token";
 
 // Logger helper to route messages to both dev console and Electron main process logs
+// Set DEBUG_AUTH=true locally to see verbose auth token flow messages.
+// In production these are suppressed to prevent console flooding.
+const DEBUG_AUTH = process.env.REACT_APP_DEBUG_AUTH === 'true' || false;
+
 const log = (tag, message) => {
+  // Only log if debug mode or if it's an important non-routine message
+  const isVerboseRoutine = (
+    tag === 'AUTH-STORE' &&
+    (message === 'getAccess requested' ||
+     message === 'getAccess using memory cache' ||
+     message === 'getRefresh requested' ||
+     message === 'getRefresh using memory cache' ||
+     message.startsWith('getAccess localStorage') ||
+     message.startsWith('getRefresh localStorage'))
+  );
+  if (!DEBUG_AUTH && isVerboseRoutine) return;
+
   console.log(`[${tag}]`, message);
   if (window.electronAPI && window.electronAPI.log) {
     try {

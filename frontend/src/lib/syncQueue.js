@@ -35,6 +35,21 @@ export const syncQueue = {
     return entry;
   },
 
+  /** Add a delete operation to the offline queue */
+  enqueueDelete(orderId, payload = {}) {
+    const queue = getQueue();
+    const entry = {
+      id: `offline_del_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: "delete",
+      orderId,
+      payload,
+      createdAt: new Date().toISOString(),
+    };
+    queue.push(entry);
+    saveQueue(queue);
+    return entry;
+  },
+
   /** Get all pending offline orders */
   getQueue,
 

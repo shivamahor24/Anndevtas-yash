@@ -11,6 +11,25 @@ const KEYS = {
   LAST_ORDER_NUMBER: "pos_last_order_num",
 };
 
+const MIGRATION_VERSION_KEY = "pos_storage_version";
+const CURRENT_VERSION = "2.0.0_clean_slate";
+
+(function runStorageMigration() {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    const current = localStorage.getItem(MIGRATION_VERSION_KEY);
+    if (current !== CURRENT_VERSION) {
+      console.log("[Storage Migration] Purging legacy cached orders to align with clean server baseline...");
+      localStorage.removeItem(KEYS.ORDERS);
+      localStorage.setItem(KEYS.LAST_ORDER_NUMBER, "0");
+      localStorage.removeItem("pos_sync_queue");
+      localStorage.setItem(MIGRATION_VERSION_KEY, CURRENT_VERSION);
+    }
+  } catch (e) {
+    console.warn("Storage migration check failed:", e);
+  }
+})();
+
 function save(key, data) {
   try {
     localStorage.setItem(key, JSON.stringify({ data, ts: Date.now() }));
@@ -48,9 +67,6 @@ export function canonicalBillNumber(val) {
   if (/[a-zA-Z_-]/.test(withoutPrefix)) return 0;
   const n = parseInt(withoutPrefix.replace(/[^0-9]/g, ""), 10);
   if (isNaN(n) || n <= 0) return 0;
-  if (n >= 1001 && n < 2000) {
-    return n - 1000;
-  }
   return n;
 }
 
@@ -169,6 +185,10 @@ export function normalizeOrder(order) {
     payment_status: paymentStatus,
     orderStatus: orderStatus,
     order_status: orderStatus,
+    is_deleted: Boolean(order.is_deleted || order.deleted || order.deleted_at),
+    deleted_at: order.deleted_at || null,
+    deleted_by: order.deleted_by || null,
+    deletion_reason: order.deletion_reason || order.reason || "",
     cashier: order.cashier || order.cashier_name || "Cashier",
     cashier_name: order.cashier_name || order.cashier || "Cashier",
     cashier_email: order.cashier_email || "",
@@ -202,11 +222,19 @@ export function deduplicateOrders(ordersList) {
       const chosenItems = hasBetterItems ? order.items : existing.items;
       const chosenTotal = (order.grandTotal && order.grandTotal > 0) ? order.grandTotal : existing.grandTotal;
 
+      const isDel = Boolean(existing.is_deleted || order.is_deleted);
+      const delAt = order.deleted_at || existing.deleted_at || null;
+      const delBy = order.deleted_by || existing.deleted_by || null;
+      const delReason = order.deletion_reason || existing.deletion_reason || "";
+
       const merged = {
         ...existing,
         ...order,
         id: existing.id || order.id,
         server_id: existing.server_id || order.server_id,
+        billNumber: existing.billNumber || order.billNumber,
+        orderNumber: existing.orderNumber || order.orderNumber,
+        receipt_no: existing.receipt_no || order.receipt_no,
         items: chosenItems,
         grandTotal: chosenTotal,
         total: chosenTotal,
@@ -215,53 +243,33 @@ export function deduplicateOrders(ordersList) {
         customerName: order.customerName || existing.customerName || "",
         customerPhone: order.customerPhone || existing.customerPhone || "",
         tableNumber: order.tableNumber || existing.tableNumber || "",
+        is_deleted: isDel,
+        deleted_at: delAt,
+        deleted_by: delBy,
+        deletion_reason: delReason,
         updatedAt: new Date().toISOString(),
       };
       orderMap.set(primaryKey, merged);
     }
   });
 
-  return Array.from(orderMap.values());
+  // Return sorted descending (newest bill number first)
+  return Array.from(orderMap.values()).sort((a, b) => {
+    const aNum = canonicalBillNumber(a.billNumber || a.orderNumber || a.receipt_no);
+    const bNum = canonicalBillNumber(b.billNumber || b.orderNumber || b.receipt_no);
+    if (aNum !== bNum) return bNum - aNum;
+    return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
+  });
 }
 
 
 /**
- * Ensures that the list of orders forms a strictly continuous, gap-free, duplicate-free sequential bill number series.
- * Preserves the lowest starting bill number (e.g. 1, 2020, 2021) and ensures each subsequent order is exactly previous + 1.
- * Internal IDs and order data are preserved untouched.
+ * Deprecated: Order numbers are permanent historical identifiers.
+ * This function is preserved for interface compatibility but is strictly a no-op.
+ * NEVER modifies, shifts, or recalculates order numbers.
  */
 export function healSequenceGaps(ordersList) {
-  if (!Array.isArray(ordersList) || ordersList.length === 0) return [];
-  if (ordersList.length === 1) return ordersList;
-
-  // Sort chronological / ascending by existing canonical bill number, fallback to createdAt
-  const sorted = [...ordersList].sort((a, b) => {
-    const aNum = canonicalBillNumber(a.billNumber || a.orderNumber || a.receipt_no);
-    const bNum = canonicalBillNumber(b.billNumber || b.orderNumber || b.receipt_no);
-    if (aNum > 0 && bNum > 0 && aNum !== bNum) return aNum - bNum;
-    return new Date(a.createdAt || 0) - new Date(b.createdAt || 0);
-  });
-
-  const baseNum = canonicalBillNumber(sorted[0].billNumber || sorted[0].orderNumber || sorted[0].receipt_no) || 1;
-
-  sorted.forEach((order, index) => {
-    const targetBillNum = baseNum + index;
-    const currentNum = canonicalBillNumber(order.billNumber || order.orderNumber || order.receipt_no);
-    if (currentNum !== targetBillNum) {
-      order.billNumber = targetBillNum;
-      order.orderNumber = targetBillNum;
-      order.receipt_no = targetBillNum;
-      order.updatedAt = new Date().toISOString();
-    }
-  });
-
-  // Return sorted descending (newest bill first)
-  return sorted.sort((a, b) => {
-    const aNum = Number(a.billNumber || a.orderNumber || a.receipt_no || 0);
-    const bNum = Number(b.billNumber || b.orderNumber || b.receipt_no || 0);
-    if (aNum !== bNum) return bNum - aNum;
-    return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
-  });
+  return Array.isArray(ordersList) ? ordersList : [];
 }
 
 // ----------------------------------------------------
@@ -269,20 +277,43 @@ export function healSequenceGaps(ordersList) {
 // ----------------------------------------------------
 
 /**
+ * Returns all raw orders from localStorage without status filtering.
+ */
+function getAllOrdersRaw() {
+  try {
+    const raw = localStorage.getItem(KEYS.ORDERS);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    const list = parsed?.data !== undefined ? parsed.data : parsed;
+    if (!Array.isArray(list)) return [];
+    return deduplicateOrders(list);
+  } catch (e) {
+    console.error("offlineStorage.getAllOrdersRaw failed:", e);
+    return [];
+  }
+}
+
+/**
  * Returns the next simple sequential Bill Number starting from 1 (#1, #2, #3...) or continuing the sequence.
- * Always continues from the current highest bill number + 1.
+ * Always continues from the highest bill number ever assigned (active or deleted).
+ * NEVER reuses numbers from deleted orders.
  */
 export function getNextOrderNumber() {
   try {
-    const orders = getOrders();
+    const allOrders = getAllOrdersRaw();
     let maxBillNum = 0;
-    orders.forEach((o) => {
+    allOrders.forEach((o) => {
       const num = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
       if (num > maxBillNum) maxBillNum = num;
     });
 
+    if (allOrders.length === 0) {
+      localStorage.setItem(KEYS.LAST_ORDER_NUMBER, "0");
+      return 1;
+    }
+
     const storedLast = canonicalBillNumber(localStorage.getItem(KEYS.LAST_ORDER_NUMBER) || 0);
-    const nextNum = maxBillNum > 0 ? (maxBillNum + 1) : Math.max(storedLast, 0) + 1;
+    const nextNum = Math.max(maxBillNum, storedLast) + 1;
     localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(nextNum));
     return nextNum;
   } catch (e) {
@@ -291,43 +322,43 @@ export function getNextOrderNumber() {
   }
 }
 
-export function getOrders() {
+/**
+ * Retrieves active (non-deleted) orders by default.
+ * Pass { includeDeleted: true } to receive all orders including archived/deleted.
+ */
+export function getOrders(options = {}) {
   try {
-    const raw = localStorage.getItem(KEYS.ORDERS);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    const list = parsed?.data !== undefined ? parsed.data : parsed;
-    if (!Array.isArray(list)) return [];
-
-    const deduplicated = deduplicateOrders(list);
-    const sequenced = healSequenceGaps(deduplicated);
-
-    // If existing duplicate data or gaps were healed, persist the clean array back
-    if (sequenced.length !== list.length || JSON.stringify(sequenced) !== JSON.stringify(list)) {
-      save(KEYS.ORDERS, sequenced);
-
-      let maxBillNum = 0;
-      sequenced.forEach((o) => {
-        const num = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
-        if (num > maxBillNum) maxBillNum = num;
-      });
-      localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(maxBillNum));
+    const all = getAllOrdersRaw();
+    if (options.includeDeleted) {
+      return all;
     }
-
-    return sequenced;
+    return all.filter((o) => !o.is_deleted && !o.deleted_at);
   } catch (e) {
     console.error("offlineStorage.getOrders failed:", e);
     throw new Error(`Unable to load orders from storage: ${e.message}`);
   }
 }
 
+/**
+ * Retrieves only soft-deleted/archived orders.
+ */
+export function getDeletedOrders() {
+  try {
+    const all = getAllOrdersRaw();
+    return all.filter((o) => Boolean(o.is_deleted || o.deleted_at));
+  } catch (e) {
+    console.error("offlineStorage.getDeletedOrders failed:", e);
+    return [];
+  }
+}
+
 export function getOrderById(orderId) {
   if (!orderId) return null;
-  const orders = getOrders();
+  const all = getAllOrdersRaw();
   const searchKey = String(orderId).trim();
   const searchNum = canonicalBillNumber(searchKey);
 
-  return orders.find(
+  return all.find(
     (o) =>
       String(o.id) === searchKey ||
       String(o.server_id) === searchKey ||
@@ -363,21 +394,16 @@ export function saveOrder(order) {
     updatedAt: new Date().toISOString(),
   });
 
-  // Load existing orders safely
-  let currentOrders = [];
-  try {
-    currentOrders = getOrders();
-  } catch (e) {
-    currentOrders = [];
-  }
+  // Load existing raw orders safely (including soft-deleted)
+  let currentOrders = getAllOrdersRaw();
 
-  // Check if order already exists in storage (strictly by permanent order ID)
+  // Check if order already exists in storage
   const existingIndex = currentOrders.findIndex((o) =>
-    String(o.id) === String(normalized.id)
+    String(o.id) === String(normalized.id) ||
+    (o.server_id && normalized.server_id && String(o.server_id) === String(normalized.server_id))
   );
 
   if (existingIndex >= 0) {
-    // Update existing record rather than creating a duplicate
     const existing = currentOrders[existingIndex];
     currentOrders[existingIndex] = {
       ...existing,
@@ -385,32 +411,29 @@ export function saveOrder(order) {
       id: existing.id || normalized.id,
       server_id: existing.server_id || normalized.server_id,
       billNumber: existing.billNumber || normalized.billNumber,
-      orderNumber: existing.billNumber || normalized.billNumber,
-      receipt_no: existing.billNumber || normalized.billNumber,
+      orderNumber: existing.orderNumber || normalized.orderNumber,
+      receipt_no: existing.receipt_no || normalized.receipt_no,
+      is_deleted: Boolean(existing.is_deleted || normalized.is_deleted),
+      deleted_at: existing.deleted_at || normalized.deleted_at,
+      deleted_by: existing.deleted_by || normalized.deleted_by,
+      deletion_reason: existing.deletion_reason || normalized.deletion_reason,
       updatedAt: new Date().toISOString(),
     };
   } else {
     currentOrders.unshift(normalized);
   }
 
-  // Run deduplication and sequencing to guarantee continuous series
+  // Deduplicate orders without modifying any sequence numbers
   const deduplicated = deduplicateOrders(currentOrders);
-  const sequenced = healSequenceGaps(deduplicated);
-  save(KEYS.ORDERS, sequenced);
+  save(KEYS.ORDERS, deduplicated);
 
-  // Update LAST_ORDER_NUMBER so next checkout continues sequentially
-  let maxBillNum = 0;
-  sequenced.forEach((o) => {
-    const num = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
-    if (num > maxBillNum) maxBillNum = num;
-  });
-  localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(maxBillNum));
-
-  // Verification step
-  const savedVerification = getOrderById(normalized.id) || getOrderById(normalized.billNumber);
-  if (!savedVerification) {
-    throw new Error("Storage verification failed: order was not found in offline storage after write.");
+  // Keep LAST_ORDER_NUMBER strictly monotonic (never decrement)
+  const storedLast = canonicalBillNumber(localStorage.getItem(KEYS.LAST_ORDER_NUMBER) || 0);
+  if (billNumber > storedLast) {
+    localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(billNumber));
   }
+
+  const savedVerification = getOrderById(normalized.id) || normalized;
 
   // Emit events for reactive cross-component synchronization
   try {
@@ -423,7 +446,7 @@ export function saveOrder(order) {
 
 export function updateOrder(orderId, updates) {
   if (!orderId) throw new Error("Order ID is required to update order");
-  const orders = getOrders();
+  const orders = getAllOrdersRaw();
   const searchKey = String(orderId).trim();
   const searchNum = canonicalBillNumber(searchKey);
 
@@ -439,15 +462,15 @@ export function updateOrder(orderId, updates) {
   }
 
   const existing = orders[idx];
-  // Preserve permanent bill number
-  const originalBillNumber = existing.billNumber || existing.orderNumber || existing.receipt_no;
+  // Preserve permanent bill number, or adopt authoritative canonical receipt_no from server
+  const targetBillNumber = updates.receipt_no || updates.billNumber || updates.orderNumber || existing.billNumber || existing.orderNumber || existing.receipt_no;
 
   const updatedOrder = normalizeOrder({
     ...existing,
     ...updates,
-    billNumber: originalBillNumber,
-    orderNumber: originalBillNumber,
-    receipt_no: originalBillNumber,
+    billNumber: targetBillNumber,
+    orderNumber: targetBillNumber,
+    receipt_no: targetBillNumber,
     updatedAt: new Date().toISOString(),
   });
 
@@ -463,13 +486,21 @@ export function updateOrder(orderId, updates) {
   return updatedOrder;
 }
 
-export function deleteOrder(orderId) {
+/**
+ * Soft-deletes an order.
+ * Marks the order as deleted and archives it in Deleted Orders.
+ * IMMUTABLE ORDER NUMBERS:
+ * - The original bill number remains permanently on the deleted order.
+ * - Subsequent orders are NEVER shifted or renumbered.
+ * - Sequence counter is NEVER decremented.
+ */
+export function deleteOrder(orderId, auditInfo = {}) {
   if (!orderId) return false;
-  const orders = getOrders();
+  const allOrders = getAllOrdersRaw();
   const searchKey = String(orderId).trim();
   const searchNum = canonicalBillNumber(searchKey);
 
-  const targetIdx = orders.findIndex(
+  const targetIdx = allOrders.findIndex(
     (o) =>
       String(o.id) === searchKey ||
       String(o.server_id) === searchKey ||
@@ -481,63 +512,315 @@ export function deleteOrder(orderId) {
     return false;
   }
 
-  const targetOrder = orders[targetIdx];
-  const deletedBillNum = canonicalBillNumber(targetOrder.billNumber || targetOrder.orderNumber || targetOrder.receipt_no);
+  const targetOrder = allOrders[targetIdx];
+  const now = new Date().toISOString();
 
-  // 1. Remove the deleted order record
-  let remaining = orders.filter(
-    (o) =>
-      o.id !== targetOrder.id &&
-      (!targetOrder.server_id || o.server_id !== targetOrder.server_id)
-  );
+  // Soft delete: retain full order data and attach audit trail
+  const updatedDeletedOrder = {
+    ...targetOrder,
+    is_deleted: true,
+    deleted_at: auditInfo.deleted_at || now,
+    deleted_by: auditInfo.deleted_by || auditInfo.user || "Admin",
+    deletion_reason: auditInfo.deletion_reason || auditInfo.reason || "Deleted by owner",
+    updatedAt: now,
+  };
 
-  // 2. Decrease the customer-facing bill number by 1 for every bill that came after the deleted bill
-  if (deletedBillNum > 0) {
-    remaining.forEach((o) => {
-      const bNum = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
-      if (bNum > deletedBillNum) {
-        const shifted = bNum - 1;
-        o.billNumber = shifted;
-        o.orderNumber = shifted;
-        o.receipt_no = shifted;
-        o.updatedAt = new Date().toISOString();
-      }
-    });
-  }
+  allOrders[targetIdx] = updatedDeletedOrder;
 
-  // 3. Heal any remaining sequence gaps to guarantee continuous 1, 2, 3... series
-  remaining = healSequenceGaps(remaining);
+  const deduplicated = deduplicateOrders(allOrders);
+  save(KEYS.ORDERS, deduplicated);
 
-  // 4. Update the latest order number counter based on current remaining orders
-  let maxBillNum = 0;
-  remaining.forEach((o) => {
-    const num = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
-    if (num > maxBillNum) maxBillNum = num;
-  });
-  localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(maxBillNum));
+  // CRITICAL: NEVER shift any bill numbers!
+  // CRITICAL: NEVER decrement LAST_ORDER_NUMBER!
 
-  // 5. Persist the updated orders to local storage
-  save(KEYS.ORDERS, remaining);
-
-  // 6. Broadcast event across all components (Order History, Reports, Dashboard)
   try {
-    window.dispatchEvent(new CustomEvent("ordersUpdated", { detail: { deletedId: targetOrder.id, remaining } }));
-    window.dispatchEvent(new CustomEvent("pos_orders_changed", { detail: { deletedId: targetOrder.id, remaining } }));
+    window.dispatchEvent(new CustomEvent("ordersUpdated", { detail: updatedDeletedOrder }));
+    window.dispatchEvent(new CustomEvent("pos_orders_changed", { detail: updatedDeletedOrder }));
   } catch (_) {}
 
-  return true;
+  return updatedDeletedOrder;
+}
+
+/**
+ * Restores a soft-deleted order back to the active orders section.
+ * - Clears is_deleted, deleted_at, deleted_by, deletion_reason.
+ * - Preserves original billNumber and order sequence position.
+ */
+export function restoreOrder(orderId) {
+  if (!orderId) return false;
+  const allOrders = getAllOrdersRaw();
+  const searchKey = String(orderId).trim();
+  const searchNum = canonicalBillNumber(searchKey);
+
+  const targetIdx = allOrders.findIndex(
+    (o) =>
+      String(o.id) === searchKey ||
+      String(o.server_id) === searchKey ||
+      (searchNum > 0 && (o.billNumber === searchNum || o.orderNumber === searchNum || o.receipt_no === searchNum))
+  );
+
+  if (targetIdx < 0) {
+    console.warn(`restoreOrder: Order ${orderId} not found in offline storage.`);
+    return false;
+  }
+
+  const targetOrder = allOrders[targetIdx];
+  const updatedRestoredOrder = {
+    ...targetOrder,
+    is_deleted: false,
+    deleted_at: null,
+    deleted_by: null,
+    deletion_reason: null,
+    updatedAt: new Date().toISOString(),
+  };
+
+  allOrders[targetIdx] = updatedRestoredOrder;
+  const deduplicated = deduplicateOrders(allOrders);
+  save(KEYS.ORDERS, deduplicated);
+
+  try {
+    window.dispatchEvent(new CustomEvent("ordersUpdated", { detail: updatedRestoredOrder }));
+    window.dispatchEvent(new CustomEvent("pos_orders_changed", { detail: updatedRestoredOrder }));
+  } catch (_) {}
+
+  return updatedRestoredOrder;
+}
+
+/**
+ * Soft-deletes all currently active orders.
+ * Retains permanent bill numbers and attaches audit metadata.
+ */
+export function deleteAllOrders(auditInfo = {}) {
+  const allOrders = getAllOrdersRaw();
+  const now = new Date().toISOString();
+  const deleter = auditInfo.deleted_by || auditInfo.user || "Admin";
+  const reason = auditInfo.deletion_reason || auditInfo.reason || "Bulk deleted by user";
+
+  let count = 0;
+  const updated = allOrders.map((o) => {
+    if (!o.is_deleted) {
+      count++;
+      return {
+        ...o,
+        is_deleted: true,
+        deleted_at: auditInfo.deleted_at || now,
+        deleted_by: deleter,
+        deletion_reason: reason,
+        updatedAt: now,
+      };
+    }
+    return o;
+  });
+
+  save(KEYS.ORDERS, updated);
+
+  try {
+    window.dispatchEvent(new CustomEvent("ordersUpdated", { detail: { action: "bulk_delete", count } }));
+    window.dispatchEvent(new CustomEvent("pos_orders_changed", { detail: { action: "bulk_delete", count } }));
+  } catch (_) {}
+
+  return count;
+}
+
+/**
+ * Restores all soft-deleted orders back to active status.
+ * Retains original canonical numbers and sequence positions.
+ */
+export function restoreAllOrders() {
+  const allOrders = getAllOrdersRaw();
+  const now = new Date().toISOString();
+
+  let count = 0;
+  const updated = allOrders.map((o) => {
+    if (o.is_deleted) {
+      count++;
+      return {
+        ...o,
+        is_deleted: false,
+        deleted_at: null,
+        deleted_by: null,
+        deletion_reason: null,
+        updatedAt: now,
+      };
+    }
+    return o;
+  });
+
+  save(KEYS.ORDERS, updated);
+
+  try {
+    window.dispatchEvent(new CustomEvent("ordersUpdated", { detail: { action: "bulk_restore", count } }));
+    window.dispatchEvent(new CustomEvent("pos_orders_changed", { detail: { action: "bulk_restore", count } }));
+  } catch (_) {}
+
+  return count;
 }
 
 export function resetOrders() {
   try {
-    localStorage.removeItem(KEYS.ORDERS);
-    localStorage.setItem(KEYS.LAST_ORDER_NUMBER, "0");
-    window.dispatchEvent(new CustomEvent("ordersUpdated"));
-    window.dispatchEvent(new CustomEvent("pos_orders_changed"));
+    save(KEYS.ORDERS, []);
+    localStorage.removeItem(KEYS.LAST_ORDER_NUMBER);
+    window.dispatchEvent(new CustomEvent("ordersUpdated", { detail: { action: "reset" } }));
+    window.dispatchEvent(new CustomEvent("pos_orders_changed", { detail: { action: "reset" } }));
     return true;
   } catch (e) {
     console.error("Failed to reset orders:", e);
     throw e;
+  }
+}
+
+/**
+ * Batch-saves an array of orders in a single localStorage read+write cycle.
+ * Use this for server hydration to avoid the N saveOrder() → N events → N fetch() loop.
+ *
+ * Options:
+ *   emit: boolean (default true) — whether to dispatch ordersUpdated/pos_orders_changed.
+ *         Set to false when hydrating from server so the page does NOT react to its own write.
+ *
+ * Guarantees:
+ *   - Reads existing orders exactly once
+ *   - Merges all incoming orders (preserving offline-only orders)
+ *   - Deduplicates by stable order ID
+ *   - Preserves immutable bill/receipt numbers
+ *   - Preserves soft-deleted orders
+ *   - Writes localStorage exactly once
+ *   - Emits events at most once (or zero times if emit:false)
+ */
+export function saveOrdersBatch(orders, options = {}) {
+  if (!Array.isArray(orders)) return;
+  const { emit = true, syncWithServer = false } = options;
+  if (!syncWithServer && orders.length === 0) return;
+
+  // --- 1. Read existing storage once ---
+  let currentOrders = getAllOrdersRaw();
+
+  // --- 2. Build a fast-lookup map of existing orders by ID and server_id ---
+  const existingById = new Map();
+  const existingByServerId = new Map();
+  currentOrders.forEach((o) => {
+    existingById.set(String(o.id), o);
+    if (o.server_id) existingByServerId.set(String(o.server_id), o);
+  });
+
+  // --- 3. Merge each incoming order ---
+  const incomingNormalized = [];
+  orders.forEach((raw) => {
+    if (!raw || typeof raw !== 'object') return;
+    if (!Array.isArray(raw.items) || raw.items.length === 0) return;
+
+    const normalized = normalizeOrder(raw);
+    if (!normalized) return;
+
+    // Resolve existing record by ID or server_id
+    let existing =
+      existingById.get(String(normalized.id)) ||
+      (normalized.server_id ? existingByServerId.get(String(normalized.server_id)) : null);
+
+    if (existing) {
+      // Merge: adopt canonical receipt_no from incoming server data, or preserve existing
+      const canonicalNum = normalized.receipt_no || normalized.billNumber || normalized.orderNumber ||
+                           existing.billNumber || existing.orderNumber || existing.receipt_no;
+      const billNum = canonicalBillNumber(canonicalNum);
+
+      const merged = {
+        ...existing,
+        ...normalized,
+        id: existing.id || normalized.id,
+        server_id: existing.server_id || normalized.server_id,
+        billNumber: billNum > 0 ? billNum : (existing.billNumber || normalized.billNumber),
+        orderNumber: billNum > 0 ? billNum : (existing.orderNumber || normalized.orderNumber),
+        receipt_no: billNum > 0 ? billNum : (existing.receipt_no || normalized.receipt_no),
+        is_deleted: Boolean(existing.is_deleted || normalized.is_deleted),
+        deleted_at: existing.deleted_at || normalized.deleted_at || null,
+        deleted_by: existing.deleted_by || normalized.deleted_by || null,
+        deletion_reason: existing.deletion_reason || normalized.deletion_reason || '',
+        createdAt: existing.createdAt || normalized.createdAt,
+        paid_at: existing.paid_at || normalized.paid_at,
+        updatedAt: new Date().toISOString(),
+      };
+      incomingNormalized.push(merged);
+    } else {
+      // New order: assign bill number if missing
+      let billNum = canonicalBillNumber(normalized.billNumber || normalized.orderNumber || normalized.receipt_no);
+      if (!billNum || billNum <= 0) {
+        // Compute next order number once we know the existing maximum
+        const allNums = currentOrders.map((o) =>
+          canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no)
+        ).filter((n) => n > 0);
+        const storedLast = canonicalBillNumber(localStorage.getItem(KEYS.LAST_ORDER_NUMBER) || 0);
+        billNum = Math.max(...allNums, storedLast, 0) + 1;
+        localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(billNum));
+      }
+      incomingNormalized.push({
+        ...normalized,
+        billNumber: billNum,
+        orderNumber: billNum,
+        receipt_no: billNum,
+      });
+    }
+  });
+
+  // --- 4. Merge into current list ---
+  let merged = [];
+  if (syncWithServer) {
+    // Reconcile with server: server records take precedence, while preserving any pending offline creations
+    let pendingUnsynced = [];
+    try {
+      const q = (typeof window !== "undefined" && window.localStorage)
+        ? JSON.parse(localStorage.getItem("pos_sync_queue") || "[]")
+        : [];
+      const pendingIds = new Set(
+        Array.isArray(q)
+          ? q.map((item) => String(item.order_id || item.id || item.order?.id || "")).filter(Boolean)
+          : []
+      );
+      pendingUnsynced = currentOrders.filter((o) => {
+        const idStr = String(o.id || "");
+        return pendingIds.has(idStr);
+      });
+    } catch (_) {
+      pendingUnsynced = [];
+    }
+
+    const mergedMap = new Map();
+    incomingNormalized.forEach((o) => mergedMap.set(String(o.id), o));
+    pendingUnsynced.forEach((o) => {
+      if (!mergedMap.has(String(o.id))) {
+        mergedMap.set(String(o.id), o);
+      }
+    });
+    merged = deduplicateOrders(Array.from(mergedMap.values()));
+  } else {
+    const mergedMap = new Map();
+    currentOrders.forEach((o) => mergedMap.set(String(o.id), o));
+    incomingNormalized.forEach((o) => mergedMap.set(String(o.id), o));
+    merged = deduplicateOrders(Array.from(mergedMap.values()));
+  }
+
+  // --- 5. Update LAST_ORDER_NUMBER ---
+  let maxBillNum = 0;
+  merged.forEach((o) => {
+    const n = canonicalBillNumber(o.billNumber || o.orderNumber || o.receipt_no);
+    if (n > maxBillNum) maxBillNum = n;
+  });
+
+  if (syncWithServer) {
+    localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(maxBillNum));
+  } else {
+    const storedLast = canonicalBillNumber(localStorage.getItem(KEYS.LAST_ORDER_NUMBER) || 0);
+    const finalLast = Math.max(maxBillNum, storedLast);
+    localStorage.setItem(KEYS.LAST_ORDER_NUMBER, String(finalLast));
+  }
+
+  // --- 6. Write localStorage exactly once ---
+  save(KEYS.ORDERS, merged);
+
+  // --- 7. Emit events at most once ---
+  if (emit) {
+    try {
+      window.dispatchEvent(new CustomEvent('ordersUpdated', { detail: { action: 'batch_sync' } }));
+      window.dispatchEvent(new CustomEvent('pos_orders_changed', { detail: { action: 'batch_sync' } }));
+    } catch (_) {}
   }
 }
 
@@ -609,10 +892,15 @@ export const offlineStorage = {
 
   // Orders
   saveOrder,
+  saveOrdersBatch,
   getOrders,
+  getDeletedOrders,
   getOrderById,
   updateOrder,
   deleteOrder,
+  deleteAllOrders,
+  restoreOrder,
+  restoreAllOrders,
   resetOrders,
   getNextOrderNumber,
   canonicalBillNumber,
