@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useState, useMemo } from "react";
-import api, { API, tokenStore } from "../lib/api";
+import React, { useCallback, useEffect, useState, useMemo, useRef } from "react";
+import api, { API } from "../lib/api";
+import { useAuth } from "../context/AuthContext";
 import { Card } from "../components/ui/card";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -84,6 +85,7 @@ const getPresetRange = (key) => {
 
 export default function Reports() {
   const { t } = useLanguage();
+  const { user: authUser } = useAuth();
   const [tab, setTab] = useState("sales");
   const [salesViewMode, setSalesViewMode] = useState("summary"); // "summary" (PDF format) or "detailed"
   const [periodKey, setPeriodKey] = useState("month");
@@ -103,13 +105,10 @@ export default function Reports() {
     }
   });
 
-  const [currentUser, setCurrentUser] = useState(() => {
-    try {
-      return offlineStorage.loadUser() || null;
-    } catch {
-      return null;
-    }
-  });
+  // currentUser comes from AuthContext — no redundant /auth/me call
+  const currentUser = authUser || (() => {
+    try { return offlineStorage.loadUser() || null; } catch { return null; }
+  })();
 
   const [dailySummaryRows, setDailySummaryRows] = useState([]);
   const [allDetailedRows, setAllDetailedRows] = useState([]);
@@ -117,6 +116,9 @@ export default function Reports() {
   const [thaliRows, setThaliRows] = useState([]);
   const [thaliPicks, setThaliPicks] = useState([]);
   const [loading, setLoading] = useState(false);
+
+  // In-flight guard: prevents overlapping/recursive fetch calls
+  const isFetchingRef = useRef(false);
 
   // Toggle accordion expand for a day's orders
   const toggleDayExpand = (dateKey) => {
@@ -140,6 +142,8 @@ export default function Reports() {
         acc.cashSales += safeNumber(r.cashSales);
         acc.upiSales += safeNumber(r.upiSales);
         acc.cardSales += safeNumber(r.cardSales);
+        acc.zomatoSales += safeNumber(r.zomatoSales);
+        acc.swiggySales += safeNumber(r.swiggySales);
         return acc;
       },
       {
@@ -152,7 +156,9 @@ export default function Reports() {
         grossSales: 0,
         cashSales: 0,
         upiSales: 0,
-        cardSales: 0
+        cardSales: 0,
+        zomatoSales: 0,
+        swiggySales: 0
       }
     );
   }, [dailySummaryRows]);
@@ -188,62 +194,20 @@ export default function Reports() {
     return getPresetRange(periodKey);
   }, [periodKey, customFrom, customTo]);
 
-  const fetch = useCallback(async () => {
-    setLoading(true);
+
+  // Pure function / callback to process orders into report tables without making network requests
+  const processReportData = useCallback((combined, range) => {
     try {
-      // 1. Dual-Sync: Fetch local orders immediately, then sync with server
-      let combined = [];
-      try {
-        combined = offlineStorage.getOrders() || [];
-      } catch (e) {
-        console.error("Local storage read error:", e);
-      }
-
-      try {
-        const res = await api.get("/orders");
-        if (Array.isArray(res.data) && res.data.length > 0) {
-          res.data.forEach((serverOrder) => {
-            try {
-              offlineStorage.saveOrder(serverOrder);
-            } catch (_) {}
-          });
-          combined = offlineStorage.getOrders() || [];
-        }
-      } catch (apiErr) {
-        console.log("Server sync optional / offline:", apiErr.message);
-      }
-
-      // Fetch restaurant settings & user info
-      try {
-        const cachedSettings = offlineStorage.loadSettings();
-        if (cachedSettings) setRestaurantInfo(cachedSettings);
-        const sRes = await api.get("/settings");
-        if (sRes.data) {
-          setRestaurantInfo(sRes.data);
-          offlineStorage.saveSettings(sRes.data);
-        }
-      } catch (_) {}
-
-      try {
-        const cachedU = offlineStorage.loadUser();
-        if (cachedU) setCurrentUser(cachedU);
-        const uRes = await api.get("/auth/me");
-        if (uRes.data) {
-          setCurrentUser(uRes.data);
-          offlineStorage.saveUser(uRes.data);
-        }
-      } catch (_) {}
-
-      // 2. Filter orders using calendar date string (YYYY-MM-DD)
-      const filteredOrders = combined.filter((o) => {
+      // 1. Filter orders using calendar date string (YYYY-MM-DD)
+      const filteredOrders = (combined || []).filter((o) => {
         const rawDate = o.paid_at || o.createdAt || o.created_at || o.date;
         if (!rawDate) return false;
         const orderDateStr = getLocalDateString(rawDate);
         if (!orderDateStr) return false;
-        return orderDateStr >= activeRange.fromStr && orderDateStr <= activeRange.toStr;
+        return orderDateStr >= range.fromStr && orderDateStr <= range.toStr;
       });
 
-      // 3. Group by Date for Daily Sales Summary (PDF Format)
+      // 2. Group by Date for Daily Sales Summary (PDF Format)
       const dayMap = new Map();
       const allDetailed = [];
 
@@ -318,6 +282,8 @@ export default function Reports() {
         let dayCash = 0;
         let dayUpi = 0;
         let dayCard = 0;
+        let dayZomato = 0;
+        let daySwiggy = 0;
 
         const dayBillDetails = dayOrders.map((o) => {
           const items = Array.isArray(o.items) ? o.items : [];
@@ -340,6 +306,8 @@ export default function Reports() {
           if (mode === "cash") dayCash += gross;
           else if (mode === "upi") dayUpi += gross;
           else if (mode === "card") dayCard += gross;
+          else if (mode === "zomato") dayZomato += gross;
+          else if (mode === "swiggy") daySwiggy += gross;
           else dayCash += gross;
 
           return {
@@ -376,6 +344,8 @@ export default function Reports() {
           cashSales: dayCash,
           upiSales: dayUpi,
           cardSales: dayCard,
+          zomatoSales: dayZomato,
+          swiggySales: daySwiggy,
           orders: dayBillDetails
         };
       });
@@ -383,7 +353,7 @@ export default function Reports() {
       setDailySummaryRows(dailySummary);
       setAllDetailedRows(allDetailed);
 
-      // 4. Compute Product Rows with Unit Rates & Total Amounts
+      // 3. Compute Product Rows with Unit Rates & Total Amounts
       const itemMap = new Map();
       filteredOrders.forEach((o) => {
         const items = Array.isArray(o.items) ? o.items : [];
@@ -421,7 +391,7 @@ export default function Reports() {
         })
         .sort((a, b) => b.revenue - a.revenue);
 
-      // 5. Compute Thali Rows & Selections
+      // 4. Compute Thali Rows & Selections
       const thaliMap = new Map();
       const picksMap = new Map();
       filteredOrders.forEach((o) => {
@@ -495,16 +465,75 @@ export default function Reports() {
       setProductRows([]);
       setThaliRows([]);
       setThaliPicks([]);
+    }
+  }, []);
+
+  const fetch = useCallback(async () => {
+    // In-flight guard: if a fetch is already running, skip this call.
+    // This prevents the event loop: saveOrder -> ordersUpdated -> fetch -> saveOrder -> ...
+    if (isFetchingRef.current) return;
+    isFetchingRef.current = true;
+    setLoading(true);
+    try {
+      // 1. Load local orders immediately for instant render
+      let combined = [];
+      try {
+        combined = offlineStorage.getOrders() || [];
+      } catch (e) {
+        console.error("Local storage read error:", e);
+      }
+
+      try {
+        const [res, delRes] = await Promise.all([
+          api.get("/orders"),
+          api.get("/orders/deleted").catch(() => ({ data: [] })),
+        ]);
+        if (Array.isArray(res.data) && Array.isArray(delRes?.data)) {
+          const activeList = res.data;
+          const deletedWithFlag = delRes.data.map((o) => ({ ...o, is_deleted: true }));
+          offlineStorage.saveOrdersBatch([...activeList, ...deletedWithFlag], {
+            emit: false,
+            syncWithServer: true,
+          });
+          combined = offlineStorage.getOrders() || [];
+        }
+      } catch (apiErr) {
+        console.log("Server sync optional / offline:", apiErr.message);
+      }
+
+      // Fetch restaurant settings (use cached first, then server)
+      try {
+        const cachedSettings = offlineStorage.loadSettings();
+        if (cachedSettings) setRestaurantInfo(cachedSettings);
+        const sRes = await api.get("/settings");
+        if (sRes.data) {
+          setRestaurantInfo(sRes.data);
+          offlineStorage.saveSettings(sRes.data);
+        }
+      } catch (_) {}
+
+      // NOTE: currentUser now comes from AuthContext — no /auth/me call here.
+
+      // 2. Compute report data from orders
+      processReportData(combined, activeRange);
     } finally {
       setLoading(false);
+      isFetchingRef.current = false;
     }
-  }, [activeRange]);
+  }, [activeRange, processReportData]);
 
   useEffect(() => {
     fetch();
 
+    // Event listener: updates from Billing checkout or local order changes
+    // Pure local recalculation — NEVER triggers another server fetch
     const handleOrdersChange = () => {
-      fetch();
+      try {
+        const combined = offlineStorage.getOrders() || [];
+        processReportData(combined, activeRange);
+      } catch (e) {
+        console.error("Reports handleOrdersChange error:", e);
+      }
     };
 
     window.addEventListener("ordersUpdated", handleOrdersChange);
@@ -513,7 +542,7 @@ export default function Reports() {
       window.removeEventListener("ordersUpdated", handleOrdersChange);
       window.removeEventListener("pos_orders_changed", handleOrdersChange);
     };
-  }, [fetch]);
+  }, [fetch, activeRange, processReportData]);
 
   // Excel Export: Multi-sheet workbook formatted exactly like the PDF
   const downloadClientXlsx = () => {
@@ -527,7 +556,7 @@ export default function Reports() {
     const wb = XLSX.utils.book_new();
 
     // -------------------------------------------------------------
-    // SHEET 1: SALES SUMMARY REPORT (PDF Layout, Zomato/Swiggy omitted)
+    // SHEET 1: SALES SUMMARY REPORT (Exact PDF Format)
     // -------------------------------------------------------------
     const salesAoa = [
       [restaurantName.toUpperCase()],
@@ -537,14 +566,13 @@ export default function Reports() {
       [
         "DATE",
         "FROM-TO BILL NO",
-        "ITEMS QTY",
         "TOTAL SALES",
         "SGST AMOUNT",
         "CGST AMOUNT",
         "GROSS SALES",
         "CASH SALES",
-        "UPI SALES",
-        "CARD SALES"
+        "ZOMATO SALES",
+        "SWIGGY SALES"
       ]
     ];
 
@@ -552,34 +580,32 @@ export default function Reports() {
       salesAoa.push([
         r.dateFormatted,
         r.fromToBillNo,
-        r.itemsQty,
         Number(safeFixed(r.totalSales)),
         Number(safeFixed(r.sgstAmount)),
         Number(safeFixed(r.cgstAmount)),
         Number(safeFixed(r.grossSales)),
         Number(safeFixed(r.cashSales)),
-        Number(safeFixed(r.upiSales)),
-        Number(safeFixed(r.cardSales))
+        Number(safeFixed(r.zomatoSales || 0)),
+        Number(safeFixed(r.swiggySales || 0))
       ]);
     });
 
     salesAoa.push([
       "TOTAL :",
-      "",
-      dailyTotals.itemsQty,
+      "—",
       Number(safeFixed(dailyTotals.totalSales)),
       Number(safeFixed(dailyTotals.sgstAmount)),
       Number(safeFixed(dailyTotals.cgstAmount)),
       Number(safeFixed(dailyTotals.grossSales)),
       Number(safeFixed(dailyTotals.cashSales)),
-      Number(safeFixed(dailyTotals.upiSales)),
-      Number(safeFixed(dailyTotals.cardSales))
+      Number(safeFixed(dailyTotals.zomatoSales || 0)),
+      Number(safeFixed(dailyTotals.swiggySales || 0))
     ]);
 
     salesAoa.push([]);
     salesAoa.push([
       `Print on ${printTimestamp} By ${printedBy}`,
-      "", "", "", "", "", "", "", "",
+      "", "", "", "", "", "", "",
       "Page No 1 Of 1"
     ]);
 
@@ -587,14 +613,13 @@ export default function Reports() {
     wsSales["!cols"] = [
       { wch: 14 }, // DATE
       { wch: 18 }, // FROM-TO BILL NO
-      { wch: 12 }, // ITEMS QTY
       { wch: 15 }, // TOTAL SALES
       { wch: 15 }, // SGST AMOUNT
       { wch: 15 }, // CGST AMOUNT
       { wch: 16 }, // GROSS SALES
       { wch: 15 }, // CASH SALES
-      { wch: 15 }, // UPI SALES
-      { wch: 15 }  // CARD SALES
+      { wch: 16 }, // ZOMATO SALES
+      { wch: 16 }  // SWIGGY SALES
     ];
     XLSX.utils.book_append_sheet(wb, wsSales, "SALES SUMMARY REPORT");
 
@@ -778,12 +803,12 @@ export default function Reports() {
       csvContent += `"${restaurantName.toUpperCase()}"\n`;
       csvContent += `"SALES SUMMARY REPORT"\n`;
       csvContent += `"From Date : ${fromFormatted} To : ${toFormatted}"\n\n`;
-      csvContent += "DATE,FROM-TO BILL NO,ITEMS QTY,TOTAL SALES,SGST AMOUNT,CGST AMOUNT,GROSS SALES,CASH SALES,UPI SALES,CARD SALES\n";
+      csvContent += "DATE,FROM-TO BILL NO,TOTAL SALES,SGST AMOUNT,CGST AMOUNT,GROSS SALES,CASH SALES,ZOMATO SALES,SWIGGY SALES\n";
       dailySummaryRows.forEach((r) => {
-        csvContent += `"${r.dateFormatted}","${r.fromToBillNo}",${r.itemsQty},${safeFixed(r.totalSales)},${safeFixed(r.sgstAmount)},${safeFixed(r.cgstAmount)},${safeFixed(r.grossSales)},${safeFixed(r.cashSales)},${safeFixed(r.upiSales)},${safeFixed(r.cardSales)}\n`;
+        csvContent += `"${r.dateFormatted}","${r.fromToBillNo}",${safeFixed(r.totalSales)},${safeFixed(r.sgstAmount)},${safeFixed(r.cgstAmount)},${safeFixed(r.grossSales)},${safeFixed(r.cashSales)},${safeFixed(r.zomatoSales || 0)},${safeFixed(r.swiggySales || 0)}\n`;
       });
-      csvContent += `"TOTAL :","",${dailyTotals.itemsQty},${safeFixed(dailyTotals.totalSales)},${safeFixed(dailyTotals.sgstAmount)},${safeFixed(dailyTotals.cgstAmount)},${safeFixed(dailyTotals.grossSales)},${safeFixed(dailyTotals.cashSales)},${safeFixed(dailyTotals.upiSales)},${safeFixed(dailyTotals.cardSales)}\n\n`;
-      csvContent += `"Print on ${printTimestamp} By ${printedBy}","","","","","","","","","Page No 1 Of 1"\n`;
+      csvContent += `"TOTAL :","—",${safeFixed(dailyTotals.totalSales)},${safeFixed(dailyTotals.sgstAmount)},${safeFixed(dailyTotals.cgstAmount)},${safeFixed(dailyTotals.grossSales)},${safeFixed(dailyTotals.cashSales)},${safeFixed(dailyTotals.zomatoSales || 0)},${safeFixed(dailyTotals.swiggySales || 0)}\n\n`;
+      csvContent += `"Print on ${printTimestamp} By ${printedBy}","","","","","","","","Page No 1 Of 1"\n`;
     } else if (tab === "products") {
       csvContent += `"${restaurantName.toUpperCase()}"\n`;
       csvContent += `"ITEM WISE SALES REPORT"\n`;
@@ -811,6 +836,131 @@ export default function Reports() {
     link.click();
     URL.revokeObjectURL(link.href);
     toast.success("CSV Report Downloaded Successfully");
+  };
+
+  const exportPDF = () => {
+    const now = new Date();
+    const printTimestamp = `${formatDisplayDate(getLocalDateString(now))} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const printedBy = currentUser?.name || currentUser?.username || "BHUPENDRA";
+    const bizName = (restaurantDisplayName || "CHEERS (C G ROAD)").toUpperCase();
+    const fromFormatted = formatDisplayDate(activeRange.fromStr);
+    const toFormatted = formatDisplayDate(activeRange.toStr);
+
+    let rowsHtml = "";
+    dailySummaryRows.forEach((r) => {
+      rowsHtml += `
+        <tr>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: left;">${r.dateFormatted}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: center; font-family: monospace;">${r.fromToBillNo}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right;">${safeFixed(r.totalSales)}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right;">${safeFixed(r.sgstAmount)}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right;">${safeFixed(r.cgstAmount)}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right; font-weight: 700;">${safeFixed(r.grossSales)}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right;">${safeFixed(r.cashSales)}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right;">${safeFixed(r.zomatoSales || 0)}</td>
+          <td style="padding: 7px 10px; border-bottom: 1px solid #cbd5e1; text-align: right;">${safeFixed(r.swiggySales || 0)}</td>
+        </tr>
+      `;
+    });
+
+    const totalRowHtml = `
+      <tr style="font-weight: bold; background: #f8fafc; border-top: 2px solid #0f172a; border-bottom: 2px solid #0f172a;">
+        <td style="padding: 8px 10px; text-align: left;">TOTAL :</td>
+        <td style="padding: 8px 10px; text-align: center;">—</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.totalSales)}</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.sgstAmount)}</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.cgstAmount)}</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.grossSales)}</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.cashSales)}</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.zomatoSales || 0)}</td>
+        <td style="padding: 8px 10px; text-align: right;">${safeFixed(dailyTotals.swiggySales || 0)}</td>
+      </tr>
+    `;
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>Sales Summary Report - ${bizName}</title>
+        <style>
+          @page { size: landscape; margin: 12mm; }
+          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; font-size: 11px; color: #0f172a; margin: 0; padding: 20px; }
+          .header { text-align: center; margin-bottom: 18px; }
+          .header h1 { margin: 0 0 4px 0; font-size: 18px; font-weight: 800; letter-spacing: 0.05em; }
+          .header h2 { margin: 0 0 6px 0; font-size: 13px; font-weight: 700; color: #334155; }
+          .header p { margin: 0; font-size: 11px; font-weight: 600; color: #64748b; }
+          table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+          th { background: #f1f5f9; padding: 8px 10px; font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em; border-top: 1px solid #94a3b8; border-bottom: 1px solid #94a3b8; }
+          .footer { margin-top: 24px; display: flex; justify-content: space-between; font-size: 10.5px; color: #64748b; border-top: 1px solid #e2e8f0; padding-top: 8px; }
+          @media print {
+            body { padding: 0; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>${bizName}</h1>
+          <h2>SALES SUMMARY REPORT</h2>
+          <p>From Date : ${fromFormatted} &nbsp;&nbsp;&nbsp;&nbsp; To : ${toFormatted}</p>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th style="text-align: left;">DATE</th>
+              <th style="text-align: center;">FROM-TO BILL NO</th>
+              <th style="text-align: right;">TOTAL SALES</th>
+              <th style="text-align: right;">SGST AMOUNT</th>
+              <th style="text-align: right;">CGST AMOUNT</th>
+              <th style="text-align: right;">GROSS SALES</th>
+              <th style="text-align: right;">CASH SALES</th>
+              <th style="text-align: right;">ZOMATO SALES</th>
+              <th style="text-align: right;">SWIGGY SALES</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml || '<tr><td colspan="9" style="text-align: center; padding: 20px;">No sales records found for this period</td></tr>'}
+            ${dailySummaryRows.length > 0 ? totalRowHtml : ''}
+          </tbody>
+        </table>
+        <div class="footer">
+          <div>Print on <strong>${printTimestamp}</strong> By <strong>${printedBy}</strong></div>
+          <div>Page No 1 Of 1</div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    const popup = window.open('', '_blank');
+    if (popup) {
+      popup.document.open();
+      popup.document.write(html);
+      popup.document.close();
+      setTimeout(() => {
+        popup.focus();
+        popup.print();
+      }, 350);
+    } else {
+      const iframe = document.createElement('iframe');
+      iframe.style.position = 'fixed';
+      iframe.style.right = '0';
+      iframe.style.bottom = '0';
+      iframe.style.width = '0';
+      iframe.style.height = '0';
+      iframe.style.border = '0';
+      document.body.appendChild(iframe);
+      const doc = iframe.contentWindow?.document || iframe.contentDocument;
+      if (doc) {
+        doc.open();
+        doc.write(html);
+        doc.close();
+        setTimeout(() => {
+          iframe.contentWindow?.focus();
+          iframe.contentWindow?.print();
+          setTimeout(() => document.body.removeChild(iframe), 30000);
+        }, 500);
+      }
+    }
   };
 
   const download = (fmt) => {
@@ -844,6 +994,13 @@ export default function Reports() {
         </div>
 
         <div className="flex gap-2 items-center flex-wrap">
+          <Button
+            onClick={exportPDF}
+            className="bg-gradient-to-r from-[#2563EB] to-[#1D4ED8] hover:brightness-105 text-white rounded-xl cursor-pointer shadow-sm text-xs h-9 px-3.5"
+            data-testid="export-pdf"
+          >
+            <Printer className="w-4 h-4 mr-1.5" /> Export PDF
+          </Button>
           <Button
             onClick={() => download("csv")}
             variant="outline"
