@@ -29,6 +29,7 @@ next-env.d.ts
 /build
 dist/
 dist
+!dist/Anndevta POS Setup 1.0.0.exe
 bin/
 /bin
 
