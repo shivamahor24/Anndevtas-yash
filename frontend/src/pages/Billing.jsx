@@ -725,7 +725,12 @@ export default function Billing() {
         api.post("/orders", payload)
           .then(({ data }) => {
             if (data?.id) {
-              offlineStorage.updateOrder(savedOrder.id, { server_id: data.id });
+              offlineStorage.updateOrder(savedOrder.id, {
+                server_id: data.id,
+                receipt_no: data.receipt_no,
+                billNumber: data.receipt_no,
+                orderNumber: data.receipt_no,
+              });
             }
           })
           .catch((err) => {

@@ -211,7 +211,7 @@ export default function ReceiptPreview({
   if (rawBillNum !== undefined && rawBillNum !== null && rawBillNum !== "") {
     const num = parseInt(String(rawBillNum).replace(/[^0-9]/g, ""), 10);
     if (!isNaN(num) && num > 0) {
-      cleanBillNum = (num >= 1001 && num < 2000) ? num - 1000 : num;
+      cleanBillNum = num;
     }
   }
   const receiptNoFormatted = cleanBillNum !== null ? `#${cleanBillNum}` : "#—";

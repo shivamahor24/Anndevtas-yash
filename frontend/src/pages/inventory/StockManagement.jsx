@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import api from "../../lib/api";
 import { Card } from "../../components/ui/card";
 import { Button } from "../../components/ui/button";
@@ -23,10 +23,13 @@ const STATUS_STYLES = {
 export default function StockManagement() {
   const [items, setItems] = useState([]);
   const [search, setSearch] = useState("");
+  // debouncedSearch is the value actually sent to the API — 300ms after user stops typing
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sortField, setSortField] = useState("name");
   const [sortDir, setSortDir] = useState(1);
   const { t } = useLanguage();
+  const abortRef = useRef(null);
 
   // Dialogs
   const [addDialog, setAddDialog] = useState(null); // { item, type: "add" | "remove" }
@@ -35,17 +38,32 @@ export default function StockManagement() {
   const [remarks, setRemarks] = useState("");
   const [invSettings, setInvSettings] = useState({});
 
+  // Debounce: wait 300ms after user stops typing before updating debouncedSearch
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(timer);
+  }, [search]);
+
   const fetchItems = useCallback(async () => {
+    // Cancel any in-flight request before starting a new one
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    abortRef.current = new AbortController();
     try {
       const params = {};
       if (statusFilter !== "all") params.status = statusFilter;
-      if (search) params.q = search;
-      const { data } = await api.get("/inventory/stock", { params });
+      if (debouncedSearch) params.q = debouncedSearch;
+      const { data } = await api.get("/inventory/stock", {
+        params,
+        signal: abortRef.current.signal,
+      });
       setItems(data);
     } catch (e) {
+      if (e.name === "CanceledError" || e.code === "ERR_CANCELED") return; // stale request, ignore
       toast.error("Failed to load stock data");
     }
-  }, [search, statusFilter]);
+  }, [debouncedSearch, statusFilter]);
 
   useEffect(() => { fetchItems(); }, [fetchItems]);
 

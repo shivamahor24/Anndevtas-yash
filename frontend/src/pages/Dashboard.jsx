@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from "react";
+import React, { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import api from "../lib/api";
 import { Card } from "../components/ui/card";
 import { TrendingUp, ShoppingBag, IndianRupee, Banknote, Smartphone, CreditCard, Sparkles } from "lucide-react";
@@ -27,6 +27,8 @@ export default function Dashboard() {
   const [data, setData] = useState(null);
   const [period, setPeriod] = useState("today");
   const { t } = useLanguage();
+  // In-flight guard to prevent overlapping fetchSummary calls
+  const isFetchingRef = useRef(false);
 
   const periods = useMemo(() => [
     { key: "today", label: t("today") },
@@ -34,7 +36,8 @@ export default function Dashboard() {
     { key: "month", label: t("this_month") },
   ], [t]);
 
-  const computeLocalSummary = useMemo(() => () => {
+  // useCallback (not useMemo) so it's a stable function reference
+  const computeLocalSummary = useCallback(() => {
     try {
       const orders = offlineStorage.getOrders();
       const now = new Date();
@@ -134,6 +137,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     const fetchSummary = async () => {
+      // In-flight guard: prevents overlapping calls from interval + event listener
+      if (isFetchingRef.current) return;
+      isFetchingRef.current = true;
       try {
         const r = await api.get("/dashboard/summary");
         setData(r.data);
@@ -141,21 +147,55 @@ export default function Dashboard() {
         console.warn("Server summary unreachable, computing local dashboard metrics:", err);
         const localData = computeLocalSummary();
         if (localData) setData(localData);
+      } finally {
+        isFetchingRef.current = false;
       }
     };
 
     fetchSummary();
-    const t = setInterval(fetchSummary, 20000);
 
-    const handleOrdersChange = () => {
-      fetchSummary();
+    // Single interval — pauses when tab is hidden to avoid background network traffic
+    const intervalRef = { id: null };
+    const startInterval = () => {
+      if (intervalRef.id) return; // guard against duplicate intervals
+      intervalRef.id = setInterval(() => {
+        if (document.visibilityState !== "hidden") {
+          fetchSummary();
+        }
+      }, 20000);
+    };
+    const stopInterval = () => {
+      if (intervalRef.id) {
+        clearInterval(intervalRef.id);
+        intervalRef.id = null;
+      }
     };
 
+    startInterval();
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        stopInterval();
+      } else {
+        startInterval();
+        fetchSummary(); // refresh immediately when tab becomes visible
+      }
+    };
+
+    // Event listener: when a new order is placed locally (Billing checkout),
+    // refresh dashboard from local data only — avoid a full server fetch on every order event.
+    const handleOrdersChange = () => {
+      const localData = computeLocalSummary();
+      if (localData) setData(localData);
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("ordersUpdated", handleOrdersChange);
     window.addEventListener("pos_orders_changed", handleOrdersChange);
 
     return () => {
-      clearInterval(t);
+      stopInterval();
+      document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("ordersUpdated", handleOrdersChange);
       window.removeEventListener("pos_orders_changed", handleOrdersChange);
     };
